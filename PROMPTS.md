@@ -126,4 +126,33 @@ not installed. The developer needs to run the install command in their own termi
 their password.
 
 Phase 1 was committed with verification on Java 25 compiling for Java 21 (bytecode major version 65). The
-tests have not yet run on a Java 21 runtime.
+tests had not yet run on a Java 21 runtime.
+
+### Follow-up: Java 21 installed by the developer
+
+Java 21 was installed outside the AI session; the AI's own install attempt had failed, as described above.
+The developer confirmed "Java 21.0.13 is now successfully installed alongside Java 25", and sent these commands
+to run:
+
+> export JAVA_HOME=$(/usr/libexec/java_home -v 21) / java -version / cd ~/Desktop/ledgerline/backend /
+> ./mvnw clean verify
+
+Actual results:
+
+| Check | Result |
+|---|---|
+| `/usr/libexec/java_home -V` | Java 25.0.3 and Java 21.0.13 (Temurin) are both installed |
+| `java -version` with `JAVA_HOME` set to 21 | `openjdk version "21.0.13" 2026-10-20 LTS` |
+| `./mvnw -v` | Maven runs on Java 21.0.13 |
+| `./mvnw clean verify` | `Tests run: 2, Failures: 0, Errors: 0`, BUILD SUCCESS |
+| Packaged jar on Java 21, `GET /api/health` | `{"status":"UP","service":"ledgerline-backend"}` |
+
+The developer then asked for the check to be repeated with `PATH` set as well
+(`export PATH="$JAVA_HOME/bin:$PATH"`), so that the plain `java` command is Java 21 too. Results of that rerun:
+`java -version` printed `Temurin-21.0.13+9 (build 21.0.13+9-LTS)`; `JAVA_HOME` was
+`/Library/Java/JavaVirtualMachines/temurin-21.jdk/Contents/Home`; javac compiled with `release 21`; and the
+clean build passed with `Tests run: 2, Failures: 0, Errors: 0, Skipped: 0`, BUILD SUCCESS.
+
+The build printed one warning: "Mockito is currently self-attaching to enable the inline-mock-maker. This will
+no longer work in future releases of the JDK." This comes from the test dependencies, and the tests still pass.
+It will be addressed when Mockito-based unit tests are added.
