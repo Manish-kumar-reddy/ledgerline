@@ -1,0 +1,2 @@
+# Applied by Spring's TestContext framework to every Spring test context in this module.
+org.springframework.test.context.ContextCustomizerFactory=com.ledgerline.support.TestDatabaseGuard
