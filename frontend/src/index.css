@@ -1,0 +1,23 @@
+:root {
+  font-family: system-ui, 'Segoe UI', Roboto, sans-serif;
+  color: #1f2937;
+  background: #f8fafc;
+}
+
+body {
+  margin: 0;
+}
+
+.placeholder {
+  max-width: 40rem;
+  margin: 15vh auto;
+  padding: 0 1rem;
+}
+
+.placeholder h1 {
+  margin-bottom: 0.25rem;
+}
+
+.status {
+  color: #64748b;
+}

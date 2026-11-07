@@ -22,3 +22,20 @@
 # virtual machine crash logs, see http://www.java.com/en/download/help/error_hotspot.xml
 hs_err_pid*
 replay_pid*
+
+# --- LedgerLine additions ---
+# Secrets: only *.example files are committed
+.env
+.env.*
+!.env.example
+
+# Build output and dependencies
+target/
+node_modules/
+dist/
+
+# Editors and operating systems
+.idea/
+*.iml
+.vscode/
+.DS_Store
