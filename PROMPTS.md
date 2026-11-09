@@ -595,3 +595,379 @@ rerun used the package-level variable shown above.
 recorded in this file before), the AI inferred two cached test contexts, each with a 10-connection Hikari pool,
 from the guard message appearing twice. That was unsupported. This run shows one Hikari pool (`HikariPool-1`)
 and no `HikariPool-2`. Why the guard message appears twice was not investigated.
+
+---
+
+## Session 7: 2026-11-09, Phase 3 (authentication)
+
+Commit reference: pending. Phase 3 is not committed yet; the latest commit is `5a1b6cf` (Phase 2).
+
+### Prompt 20: inspect and plan (no changes)
+
+> We are starting Phase 3: Authentication for LedgerLine… INSPECT ONLY. Do not modify, create, delete or format
+> any files… Identify any compatibility concerns with the existing Spring Boot 4.1.2 setup…
+
+**What the AI found (read-only):** no authentication code or security dependency existed. Spring Boot 4.1.2
+manages Spring Security 7.1.2, and its resource-server starter brings Nimbus JOSE+JWT 10.9.1. Boot does not
+manage jjwt (0 entries in its BOM), so the AI proposed Spring's own JWT support and listed 13 decisions (D1–D13)
+for the developer.
+
+**AI command error:** the first code search used `grep --include=*.java`. zsh expanded the glob before grep saw
+it (`no matches found`), so the search did not run. It was rerun with quoted patterns.
+
+### Prompt 21: decisions and corrections
+
+The developer chose:
+- the built-in bearer-token filter (no custom JWT filter)
+- 15-minute tokens with no refresh tokens
+- a database check of the user and role on every request
+- owner-only promotion to ADMIN or AUDITOR
+- BCrypt cost 12
+- rejecting unknown JSON properties
+- passwords of 12–72 UTF-8 bytes
+- 409 for a duplicate email, with identical 401s for every login failure
+- random emails in integration tests
+- rate limiting documented rather than built
+- in-memory token storage, later
+- the Mockito agent fix
+
+The developer also required corrections to the AI's plan:
+
+> 1. Fix the proposed V2 migration's PUBLIC privilege verification. Inspect PostgreSQL ACLs correctly; do not
+> assume PUBLIC is an ordinary role. 2. Safely quote and validate database role identifiers in migrations. Do
+> not allow arbitrary SQL through Flyway placeholders…
+
+**AI mistakes corrected by the developer:**
+1. The planned V2 called `has_schema_privilege('public', …)`, treating PUBLIC like a role. V2 now reads the
+   schema ACL with `aclexplode(COALESCE(nspacl, acldefault('n', nspowner)))`, where PUBLIC is grantee OID 0.
+2. The planned V3 put `${app_role}` unquoted into `GRANT`. It now uses `format('%I', …)`.
+
+**Finding reported by the AI:** a Flyway placeholder is substituted as raw text before PostgreSQL parses the
+file. A value containing `'` breaks out of any SQL string, so SQL-side validation alone cannot stop injection.
+`MigrationRoleValidator` therefore validates the value in Java before Flyway runs. The SQL checks remain as a
+second line of defence. The developer approved this, and the lower-case role-name rule.
+
+**SQL reviewed before it was applied.** V2 and V3 were tested inside a transaction that ended in `ROLLBACK` on
+`ledgerline_test_db`. Afterwards there was still only `flyway_schema_history` at v1. Results:
+- As `ledgerline_app`: inserts naming `role`, `enabled` or `created_at`, any `UPDATE`, `DELETE` and `TRUNCATE`
+  were all `permission denied`, and `ALTER`/`DROP` gave `must be owner`.
+- Plaintext passwords, mixed-case emails, duplicate emails and blank names were rejected by constraints.
+- V2 refused each bad state: PUBLIC with CREATE, the app role with CREATE, an invalid placeholder, and a
+  placeholder equal to the owner.
+
+Errors in the AI's dry-run harness:
+- The first run used zsh's `echo`, which mangled `\echo` (the same mistake as in Session 5), so nothing ran. It
+  was rebuilt in Python.
+- Two test cases were set up wrongly: the duplicate-email case ran after its first row had been rolled back,
+  and the "V3 with an unknown role" case ran where the table already existed. Both were rerun correctly and
+  produced the expected errors.
+
+### Prompt 22: implement
+
+> I approve the corrected V2 and V3 migrations and both additional details… Proceed with the full Phase 3
+> implementation… Stop and report any failed test rather than hiding or bypassing it.
+
+**Errors met during implementation, in order:**
+1. **Expected:** after Spring Security was added, the existing `HealthControllerTest` failed (`200` expected,
+   `401` received). The slice test was applying Spring Boot's default security. **Fixed** by a `@WebSecurityTest`
+   annotation that loads the real security configuration with a random per-run signing key (`RandomJwtSecret`).
+2. **The Mockito agent caused a new JVM warning:** `Sharing is only supported for boot loader classes because
+   bootstrap classpath has been appended`. **Fixed** with `-Xshare:off` alongside `-javaagent`. Afterwards there
+   were 0 agent or JVM warnings.
+3. **Test bug (AI):** `everyLoginFailureGetsTheSameResponse` re-stubbed a mock with `given(mock.login(any()))`.
+   That calls the already-stubbed method, which threw during setup. **Fixed** with `willThrow(...).given(mock)`.
+4. **Application defect (AI design mistake):** the first integration run had 9 errors in `AuthFlowIT`:
+   `Lock mode WRITE not supported for read-only entity`. The `User` entity combined `@Immutable` with
+   `@Generated` columns, which Hibernate cannot do when reading back database defaults after an insert. Every
+   registration failed. **Fixed** by removing `@Immutable` and making every column `updatable = false`.
+   That run had already applied V2 and V3 to `ledgerline_test_db` (as intended); later runs reported it up to
+   date.
+5. **Invalid evidence (AI):** the first "bad JWT_SECRET" startup check used `timeout`, which does not exist on
+   macOS (exit code 127). Java never started, so its "secret not in log" result proved nothing. It was rerun
+   without `timeout`, and the valid results are below.
+
+**Verification (actually run on 2026-11-09, Java 21.0.13):**
+
+| Check | Result |
+|---|---|
+| `./mvnw clean test` with the database URLs pointed at an unused port | 91 unit tests, 0 failures, BUILD SUCCESS |
+| `./mvnw clean verify -Pintegration-tests` | 91 unit and 28 integration tests (`DatabaseRolesIT` 5, `LedgerlineBackendApplicationIT` 1, `AuthFlowIT` 13, `UserTablePrivilegesIT` 9), 0 failures, BUILD SUCCESS |
+| Flyway on `ledgerline_test_db` | V2 and V3 applied by `ledgerline_owner` (`Successfully applied 2 migrations … now at version v3`) |
+| App started against `ledgerline_db` | Flyway applied V2 and V3. Real HTTP results: health 200 without a token; register 201 (`ACCOUNT_HOLDER`); duplicate in a different case 409; `"role":"ADMIN"` in the body 400; login 200 with `expiresIn` 900; token claims exactly `iss, sub, iat, exp, jti` with `alg` HS256 and a 900-second lifetime; wrong password and unknown email gave identical 401s; `/me` 200 with the token, and 401 `WWW-Authenticate: Bearer` without one |
+| Disabling the user (owner `UPDATE`) | The same unexpired token then got 401 `Bearer error="invalid_token"`; login with the correct password got the same generic 401 |
+| Stored password | `$2a$12$…`, 60 characters |
+| CORS | A preflight from `http://localhost:5173` was allowed; one from `https://evil.example` got 403 |
+| Startup with a bad `JWT_SECRET` (too short, not Base64, empty) | Exit 1 with no "Started" line. The messages name only the setting (`must decode to at least 32 bytes`, `is not valid Base64`, `is not set`). Neither the value nor a marker string was in the log. |
+| Secrets in the app log and PostgreSQL server log | `JWT_SECRET`, both database passwords, the test user's password and the issued token: 0 occurrences each |
+| `set-user-role.sql` on `ledgerline_test_db` | Missing email, missing role, invalid role, an injection attempt in the role and an unknown email were each refused with exit 3. Run as `ledgerline_app`: `permission denied`, role unchanged. Run as the owner: promoted to ADMIN. |
+| V1 | Unchanged (sha1 `b3e2b90ebf`), with the same checksum in both databases |
+
+**Data created during verification:** `ledgerline_test_db` holds the integration-test users, including one
+promoted to ADMIN by the bootstrap test. `ledgerline_db` holds one manual-test user (`dev-…@example.test`),
+which was then disabled. The application role cannot delete users; the owner can remove these deliberately.
+
+**Remaining limitations** (also in README.md): no login rate limiting, with an in-memory per-IP and per-email
+counter returning 429 proposed as the hardening step; no refresh tokens or revocation other than disabling a
+user; registration reveals whether an email is registered; browser token storage is deferred to Phase 9; local
+`trust` authentication.
+
+### Prompt 23: improvements before the Phase 3 commit
+
+> 1. Unknown JSON fields: Review the global `fail-on-unknown-properties` setting. Prefer restricting strict
+> unknown-field rejection to authentication request DTOs… 2. Login rate limiting: Implement a simple in-memory
+> rate limiter for login attempts, using both client IP and normalized email. Return HTTP 429… 3. Production
+> database credentials: … Document a clear production configuration where migrations run separately with the
+> owner account and the running application uses only `ledgerline_app`. Do not change the local database setup.
+
+**Design correction by the developer:** the AI had made unknown-property rejection global
+(`spring.jackson.deserialization.fail-on-unknown-properties=true`), which changes behaviour for every future
+API. It is now per type:
+- `RejectUnknownProperties` annotates `RegisterRequest` and `LoginRequest`.
+- `StrictJsonModule` (a Jackson module that Spring Boot registers) adds a `DeserializationProblemHandler`. It
+  throws only for annotated types and leaves every other type on Jackson's default, which ignores unknown
+  properties.
+- The global property was removed.
+
+**Login rate limiter:**
+- `LoginRateLimiter` keeps in-memory fixed windows that start at the first failure, keyed by client IP and by an
+  HMAC-SHA256 of the normalised email (random key per process). It never receives a password.
+- Defaults: 5 failures per email and 50 per IP in 15 minutes, with a cap of 100,000 tracked keys, all
+  configurable under `ledgerline.login-rate-limit.*`.
+- Blocked attempts get 429 with `Retry-After`, are refused before any password check, and are not counted again.
+- A successful login clears that email's count but not the IP's.
+- When the cap is reached, new keys are not tracked, so a full table cannot lock everyone out.
+
+**Errors met during this round:**
+1. **AI API mistake:** `StrictJsonModule` first called `context.addDeserializationProblemHandler(...)`, which is
+   the Jackson 2 name. It failed to compile (`cannot find symbol`). The Jackson 3.1.4 `SetupContext` method is
+   `addHandler(...)`, confirmed with `javap`.
+2. **The first version of the production migration job failed:** running the same jar with
+   `SPRING_MAIN_WEB_APPLICATION_TYPE=none` applied Flyway (`Schema "public" is up to date`), then exited with
+   code 1:
+   `Parameter 0 of method securityFilterChain … required a bean of type '…HttpSecurity' that could not be found`.
+   `HttpSecurity` only exists in a web application. **Fixed** with
+   `@ConditionalOnWebApplication(type = SERVLET)` on that one bean, so a running server still always has it.
+   This is a small code change, made so that documented migration step works; it is disclosed here and in the
+   report.
+
+**Verification (actually run on 2026-11-09, Java 21.0.13):**
+
+| Check | Result |
+|---|---|
+| `./mvnw clean test`, database URLs pointed at an unused port | 108 unit tests, 0 failures, BUILD SUCCESS |
+| `./mvnw clean verify -Pintegration-tests` | 108 unit and 30 integration tests (`AuthFlowIT` 13, `LoginRateLimitIT` 2, `UserTablePrivilegesIT` 9, `DatabaseRolesIT` 5, `LedgerlineBackendApplicationIT` 1), 0 failures, BUILD SUCCESS |
+| `StrictJsonModuleTest` (the application's own `JsonMapper`) | `RegisterRequest` with `role` and `LoginRequest` with `rememberMe` are rejected; an unannotated record with extra properties is accepted |
+| `LoginRateLimiterTest` (11 tests, controllable clock) | Blocks at the limit with the correct remaining time; the email block applies from every IP; per-IP limit; reset when the window ends; the window starts at the first failure; success resets the email but not the IP; a new instance starts empty (restart); disabled never blocks; keys contain no email address; capacity behaviour |
+| `LoginRateLimitIT` (limits 3 per email, 5 per IP) | Three wrong passwords give 401, the fourth gives 429 with `Retry-After`. The correct password, also from another IP, still gets 429. Another account from another IP gets 200. The IP limit then blocks a valid login. A success clears the email's failures. |
+| `AuthControllerTest` | 429 with `Retry-After: 300` for 299.4 seconds remaining and a generic body; the connection's remote address is passed as the client IP |
+| Production mode A: the jar from an empty folder, `SPRING_FLYWAY_ENABLED=false`, no owner variables in its environment | Started with 0 Flyway log lines and 0 errors; health 200, register 201, login 200, `/me` 200 |
+| Production mode B: migration step, `SPRING_MAIN_WEB_APPLICATION_TYPE=none` with owner variables | Before the fix: exit 1 (above). After the fix: exit 0 on its own after 2.2 s, `Schema "public" is up to date`, no Tomcat |
+| Migration step with `DB_USERNAME="x'; drop table users; --"` | Exit 1 with `Flyway placeholder app_role must be a lower-case PostgreSQL role name … Refusing to run migrations.`; Flyway did not connect; `users` still present, 3 history rows |
+| Secrets | 0 occurrences in all outputs, and in all 57 changed or new files |
+| Migrations | V1 sha1 `b3e2b90ebf`; V2 and V3 byte-identical to the approved drafts |
+
+**Not done or not verified:**
+- The Flyway CLI was not used or tested; the documented migration step is the application jar.
+- Multi-instance behaviour of the rate limiter is described, not tested.
+- `server.forward-headers-strategy` behind a real proxy was not tested.
+
+---
+
+## Session 8: 2026-11-09, Phase 3 (independent audit and remediation)
+
+Commit reference: pending. Phase 3 is not committed yet; the latest commit is `5a1b6cf` (Phase 2).
+
+### Prompt 24: independent audit (no changes)
+
+> Perform a final independent security and code-quality review of all uncommitted Phase 3 changes… classify it
+> as Critical blocker, High priority, Medium priority, Low priority, Accepted limitation… Finish with a clear
+> recommendation: READY TO COMMIT or NOT READY TO COMMIT.
+
+**Main finding (H1), an AI mistake found by the AI's own audit:**
+- `AuthService.login` checked the limit, ran BCrypt, and only then recorded a failure. A burst of parallel
+  requests all passed the check first.
+- **Measured** with the jar on `ledgerline_test_db`: 40 parallel wrong passwords for one email with a limit of
+  5 gave `{401: 40}`. Every guess had its password checked.
+- The README and the `LoginRateLimiter` Javadoc had said a burst could exceed a limit "by a few". That was
+  wrong: the overshoot was bounded only by server concurrency (Tomcat's 200 threads).
+
+**Other findings:**
+- M1: registration was unlimited (a BCrypt CPU and data-growth denial-of-service route).
+- M2: the README overstated what Hibernate's `ddl-auto=validate` catches.
+- L1–L8, low priority, including a leftover `.i.log` from a Phase 2 run.
+
+Recommendation: NOT READY TO COMMIT.
+
+### Prompts 25–26: remediation
+
+> H1 — Mandatory: Fix the concurrent login rate-limit bypass. Reserve/count login attempts atomically before
+> BCrypt password verification… Do not introduce a race where a successful login clears counters belonging to
+> other in-flight attempts… M1 — Recommended: Add a configurable per-IP registration rate limit… M2 — Mandatory:
+> Correct the README statement about Hibernate validation… L8 — Cleanup: Remove … `.i.log`.
+
+The AI proposed the design, and the developer approved both open decisions ("approve both decisions"):
+- **Strict success policy:** a success releases only its own attempt and does not erase earlier failures.
+- **Registration default:** 10 attempts per IP per hour.
+
+**What changed:**
+- **New `AttemptLimiter`:**
+  - per-key fixed windows, with every check and update under one lock
+  - all-or-nothing reservation of several keys, which refuses without counting anything
+  - release that removes only the caller's own count, and only within the same window
+- **`LoginRateLimiter`** reserves the IP and email counters before BCrypt. A failure keeps the reservation; a
+  success or an unexpected error releases it. The earlier behaviour, where a success cleared the email count,
+  was removed: it could also reset an attacker's count.
+- **New `RegistrationRateLimiter`:** per IP, reserved before `existsByEmail`, BCrypt and the insert.
+  `AuthService.register` is no longer `@Transactional`, so a refused request never borrows a database
+  connection; the insert stays transactional through `saveAndFlush`.
+- **New `TooManyAttemptsException`** (429 with `Retry-After`) replaces `LoginRateLimitedException`.
+- **Documentation:** the README's rate-limiting policy, the Hibernate validation section (M2) and the deployment
+  rule were rewritten, and the Javadocs were corrected.
+- **Test configuration:** `application-test.properties` raises the registration limit for the shared
+  integration context only; the rate-limit test classes set their own low limits.
+- `.i.log` was deleted.
+- No migration was changed.
+
+**Errors met during this round:**
+1. **Repeated AI test mistake.** `AuthServiceRateLimitTest.aSuccessInFlightDoesNotEraseAConcurrentFailure`
+   re-stubbed a mock with `when(mock.authenticate(...))`. That called the previous answer, which threw
+   `BadCredentialsException`. This is the same mistake as in Session 7. **Fixed** with
+   `doThrow(...).when(mock)`.
+2. **Test design corrected by the AI before the first run:** a polling loop with `Thread.sleep` was replaced by
+   a `CountDownLatch`, so the "refused while others are in flight" assertion does not depend on timing.
+
+**Verification (actually run on 2026-11-09, Java 21.0.13):**
+
+| Check | Result |
+|---|---|
+| `./mvnw clean test`, database URLs pointed at an unused port | 179 unit tests, 0 failures, BUILD SUCCESS |
+| `./mvnw clean verify -Pintegration-tests` | 179 unit and 35 integration tests, 0 failures, BUILD SUCCESS |
+| `AttemptLimiterTest` (66 runs, including three concurrency tests repeated 20 times each) | 64 threads released together on one key with a limit of 5: exactly 5 reserved, every repetition. 64 callers from one IP (limit 8) over 4 emails (limit 3): exactly 8 passed, no email over 3, and the IP count equals the number passed. 6 concurrent releases of 10 reservations leave exactly 4. |
+| `AuthServiceRateLimitTest` | With 5 attempts held inside the password check, the other 35 were refused (429) while those 5 were in flight, and no 6th attempt entered the check. A success completing while a failure was in flight did not erase the failure. An unexpected error gave the attempt back. Registration over the limit made no database call and no BCrypt call. 30 parallel registrations with a limit of 3: exactly 3 got through. |
+| `LoginRateLimitIT` (HTTP, limit 3 per email) | 40 parallel wrong passwords from 4 IPs: exactly 3 got 401 and 37 got 429, and the correct password then got 429. A success did not erase two earlier failures. 8 successful logins in a row were never limited. |
+| `RegistrationRateLimitIT` (HTTP, limit 3 per IP) | 201, 409 and 201 counted, then 429 with no row created; another IP got 201. 5 invalid requests (400) were not counted. 20 parallel registrations: exactly 3 got 201, 17 got 429, and 3 rows were created. |
+| H1 experiment repeated with the jar on `ledgerline_test_db` (default limits) | 40 parallel wrong passwords: `{401: 5, 429: 35}` (before the fix: `{401: 40}`). The correct password afterwards: 429. 30 parallel registrations from one IP after 1 earlier registration: `{201: 9, 429: 21}`, which is exactly 10. |
+
+## Session 9: 2026-11-09, Phase 3 (review of the rate limiter's capacity handling)
+
+Commit reference: pending. Phase 3 is not committed yet; the latest commit is `5a1b6cf` (Phase 2).
+
+**Prompt (summary):** a focused review of how `AttemptLimiter` behaves when `max-tracked-keys` is reached: can a
+login reservation be partly tracked, can a release then touch only one counter, does this contradict the
+documented all-or-nothing guarantee, can registration limiting be bypassed when full, and are there CPU or
+memory denial-of-service risks. Recommend a precise policy, add focused tests, correct Javadocs and README, run
+all suites. No commit, stage, push or deploy.
+
+**Findings:**
+1. **AI mistake (Session 8 code): partial reservations.** At capacity, `tryReserve` skipped each new key with
+   `continue` but still counted the keys already tracked. A login with a tracked IP and a new email counted only
+   the IP; the email limit did not apply. This contradicted the Javadoc and README, which said every key is
+   counted.
+2. Release was consistent with what was recorded (it only released recorded slots), but the skipped key was
+   never limited.
+3. Registration: once full, every new IP was let through uncounted. Filling the table is cheap (409 attempts are
+   counted without BCrypt; IPv6 gives many addresses).
+4. CPU: when full, every request needing a new key scanned the whole table for expired entries under the lock.
+   Memory is bounded by `max-tracked-keys`.
+
+**Measurements (actually run locally on 2026-11-09, scratch program deleted afterwards):** one BCrypt check at
+cost 12 took about 274 ms on one thread (8 cores); 100,000 email-style entries used roughly 20 MB (GC-based,
+rough); one full scan of 100,000 entries took about 2.1 ms.
+
+**Policy implemented (no reservation is ever partly counted):**
+- A key at its limit gives `Blocked` first, even when full.
+- If the new keys do not fit after removing expired entries, nothing is counted, and the caller's `OnFull` policy
+  decides: login uses `REJECT` (429, `Retry-After: 60`, before BCrypt); registration uses `ALLOW_UNTRACKED`
+  (the whole attempt, `Reservation.NONE`). Reasons and trade-offs are in the README.
+- While full, the expired-entry scan runs at most once per second of clock time.
+- Login `max-tracked-keys` must be at least 2 (an attempt needs two keys; with 1, every login would be refused).
+  This was found by the AI while writing the tests.
+
+**Tests added:** 8 in `AttemptLimiterTest` (replacing one that encoded the partial behaviour), 6 in
+`LoginRateLimiterTest`, 1 in `AuthServiceRateLimitTest` (a full login table refuses before the password check).
+
+**Verification (actually run on 2026-11-09, Java 21):**
+
+| Check | Result |
+|---|---|
+| `AttemptLimiterTest`, `LoginRateLimiterTest`, `AuthServiceRateLimitTest` | 73, 16 and 6 tests, 0 failures |
+| `./mvnw clean test`, database URLs pointed at an unused port | 193 unit tests, 0 failures, BUILD SUCCESS |
+| `./mvnw clean verify -Pintegration-tests` | 193 unit and 35 integration tests, 0 failures, BUILD SUCCESS |
+
+No migration was changed. Nothing was committed, staged or pushed.
+
+## Session 10: 2026-11-09, Phase 3 (one purge throttle for every scan)
+
+Commit reference: pending. Phase 3 is not committed yet; the latest commit is `5a1b6cf` (Phase 2).
+
+**Prompt (summary):** the user found, in their own review, that the Session 9 one-second throttle only covered
+the scan in `hasRoomFor`. The housekeeping scan every 1,000 reservations was still ungated, so high request volume
+could cause more than one full scan per second. Make every scan share one time-based throttle, keep the capacity
+policies unchanged, add tests, run all suites. No stage, commit, push or deploy.
+
+**AI mistake (Session 9):** the README and Javadoc said scans happen "at most once per second while full", but
+the existing housekeeping path was left ungated. Found by the user, not by the AI.
+
+**Change:** one private method, `purgeExpiredIfDue`, is now the only caller of the scan. Both the housekeeping
+trigger and `hasRoomFor` go through it; it scans at most once per `PURGE_INTERVAL` (1 second of clock time) and
+resets the housekeeping counter only when it actually scans. Added by the AI: if the clock moves backwards, one
+scan is allowed and the gate restarts from the new time, so a wall-clock correction cannot keep it closed.
+`FULL_PURGE_INTERVAL` was renamed `PURGE_INTERVAL`. Reservation semantics and the login/registration capacity
+policies are unchanged.
+
+**Tests added to `AttemptLimiterTest`:** 2,500 distinct-key reservations within 225 ms of clock time (both scan
+triggers arise) run exactly one scan, and one interval later exactly one more; expired entries stay until the
+gate reopens, then free capacity and the new key is counted; a backwards clock jump allows one scan.
+Checked against the old code: with the ungated housekeeping scan temporarily restored, the burst test failed
+(`expected: 1 but was: 2`); the file was then restored.
+
+**Verification (actually run on 2026-11-09, Java 21):** see the table below.
+
+| Check | Result |
+|---|---|
+| `AttemptLimiterTest`, `LoginRateLimiterTest`, `AuthServiceRateLimitTest` | all passed |
+| `./mvnw clean test`, database URLs pointed at an unused port | 196 unit tests, 0 failures, BUILD SUCCESS |
+| `./mvnw clean verify -Pintegration-tests` | 196 unit and 35 integration tests, 0 failures, BUILD SUCCESS |
+
+No migration was changed. Nothing was staged, committed or pushed.
+
+## Session 11: 2026-11-09, Phase 3 (final review and last corrections)
+
+Commit reference: pending. Phase 3 is not committed yet; the latest commit is `5a1b6cf` (Phase 2).
+
+**Prompt (summary):** a final independent review of all Phase 3 code. Then, after the review, implement only the
+approved corrections: the database-outage login issue with a regression test, README wording for login errors,
+and the reverse-proxy documentation. No refactoring, no features, no migration changes.
+
+**Review result:** one medium finding (below) and four low ones: proxy documentation (fixed here), a 12-byte
+password minimum allowing short multi-byte passwords, control characters accepted in `fullName`, and no HTTP
+test of a full rate-limit table (the last three are recorded as limitations, not changed).
+
+**AI mistake (Session 8 code and test, found by the AI in this review):** `AuthService.login` treated every
+`AuthenticationException` as a wrong password. Spring's `DaoAuthenticationProvider` wraps errors from the user
+lookup, such as a database outage, in `InternalAuthenticationServiceException`, which is an
+`AuthenticationException`. So during an outage every login was counted as a failure and answered with 401
+"Invalid email or password"; after 5 attempts the account got 429 for the rest of the window. This contradicted
+the approved policy, the README and the Javadoc. The existing test mocked `LoginAuthenticator` and so never saw
+the wrapping. Reproduced before the fix with a temporary test using the real authenticator (deleted afterwards):
+attempts 1-5 threw `InternalAuthenticationServiceException`, attempt 6 threw `TooManyAttemptsException`.
+
+**Fix:** `AuthService.login` catches `InternalAuthenticationServiceException` before `AuthenticationException`
+and rethrows its cause, so the reservation is released and the error becomes a 500 instead of a 401.
+Regression test `AuthServiceRateLimitTest.aDatabaseOutageThroughTheRealAuthenticatorIsNeitherA401NorCounted`:
+real `LoginAuthenticator`, failing repository, 12 attempts (limit 5) all end with the database exception and none
+with 429; afterwards a wrong password is an ordinary failure. The 500 status itself was not tested over HTTP.
+
+**Documentation:** README login row (401 only for authentication failures; 500 for unexpected errors, never
+reported as invalid credentials), the login rate-limit rule, and the reverse-proxy advice (`native` with trusted
+proxies, never `framework`, proxy overwrites `X-Forwarded-For`, application port reachable only from the proxy).
+
+**Verification (actually run on 2026-11-09, Java 21):**
+
+| Check | Result |
+|---|---|
+| `./mvnw clean test`, database URLs pointed at an unused port | 197 unit tests, 0 failures, BUILD SUCCESS |
+| `./mvnw clean verify -Pintegration-tests` | 197 unit and 35 integration tests, 0 failures, BUILD SUCCESS |
+| `git diff --check` | no output (covers tracked files only; untracked Phase 3 files were checked separately for trailing whitespace: none) |
+
+No migration was changed. Nothing was staged, committed or pushed.
