@@ -1047,3 +1047,167 @@ column-level grants, and the tests.
 
 V1, V2 and V3 are unchanged. V4 was applied to `ledgerline_test_db` only (by the integration tests);
 `ledgerline_db` has not been migrated. Nothing was staged, committed or pushed.
+
+---
+
+## Session 13: 2026-11-10, Phase 5 (ledger, money movement, statements)
+
+Commit reference: pending. Phase 5 is not committed yet; the latest commit is `1387fad` (Phase 4).
+
+### Design review (four rounds, read-only)
+
+1. **Read-only review prompt.** The AI inspected the repository and proposed a ledger design.
+   - **AI error:** the fetch of the official problem statement URL returned a page describing BalanceVault, and the
+     AI reported that as if it were the statement. **Corrected by the developer:** the URL is the official LedgerLine
+     statement with ten mandatory requirements, plus THREATS.md, PROMPTS.md, seed accounts per role, deployment
+     instructions, API documentation and a demo video.
+2. **Developer corrections to the first proposal:**
+   - the AI described a deferred check of debits = credits that read as a deferred `CHECK` constraint, which
+     PostgreSQL does not support; replaced by deferred constraint triggers;
+   - the accounting model had to be defined precisely; it became double-entry with balance = credits − debits for
+     every account, with worked examples;
+   - the AI had written that the posting function "checks ownership again" as if that proved the HTTP user's
+     identity; the trust boundary was rewritten honestly (the database checks only the id it is given).
+3. **Developer's final corrections:**
+   - proof that stored balances equal credits − debits;
+   - per-account sequence integrity;
+   - complete trigger conditions;
+   - function security;
+   - limits (₹10,00,000 per operation, ₹1,00,00,000 per balance).
+
+   **AI design changes in response:**
+   - sequence numbers moved into one `account_statement_lines` table with primary key `(account_id, seq)`,
+     because a unique index per table could not stop a posted and a refused line sharing a number;
+   - the idempotency outcome is linked from the outcome rows, so no append-only row is ever updated.
+4. **Implementation authorised** with the product decisions: holders deposit, withdraw and transfer from their
+   own accounts; ADMIN and AUDITOR are read-only; no overdraft; INR only; simulated settlement account.
+
+### What was implemented
+
+- `V5__create_ledger.sql`:
+  - `accounts` extended with `kind`, `balance_minor` and `last_seq`, plus checks; the seeded settlement account;
+  - `idempotency_keys`, `journal_transactions`, `ledger_entries`, `refused_attempts`, `account_statement_lines`;
+  - deferred constraint triggers (journal, entry, refusal, key outcome, account consistency), an immediate gap
+    check, append-only triggers and an account guard;
+  - `ledger_post` plus three `SECURITY DEFINER` wrappers, `ledger_outcome` and `ledger_reconciliation`;
+  - permissions: the app role is read-only on the ledger and can execute the three posting functions and
+    reconciliation only. V1–V4 unchanged.
+- Java:
+  - `Money` (exact string → paise) and `JsonStringOnly` (rejects JSON numbers);
+  - request and response types; `LedgerService` (initiator from `CurrentUser`, owner check, function call,
+    SQLSTATE mapping); `StatementService`; `ReconciliationService`;
+  - `LedgerController` and `OversightLedgerController`; URL rules; CORS headers (`Idempotency-Key` allowed;
+    `Retry-After` and `Idempotent-Replayed` exposed);
+  - error mapping: 409, 503, 400, and a generic 500 for database errors.
+- Phase 4 tests updated for V5 facts: the migration list, the `accounts` column privileges, the account response
+  fields.
+- README Ledger section, THREATS.md (new).
+
+### Mistakes and errors in this session (all found by running things)
+
+1. **AI SQL bug, caught before the migration was ever applied.** The AI first rehearsed V5 inside a rolled-back
+   transaction on `ledgerline_test_db`. The posting function ran `SET CONSTRAINTS ALL IMMEDIATE`, which lasts for
+   the rest of the transaction, so a second posting in the same transaction failed its idempotency-key check
+   (`... has 0 outcomes`). **Fixed** by restoring `SET CONSTRAINTS ALL DEFERRED` afterwards. The rehearsal then
+   matched the worked example exactly and reconciliation reported 0 differences.
+2. **AI test mistake, repeated for the third time** (Sessions 7 and 8 before): re-stubbing a Mockito mock with
+   `given(mock.call())` invoked the previous stub, which threw. Fixed with `willThrow(...).given(mock)`.
+3. **AI test assumption repeated from Phase 4:** a test asserted that a 500 body did not contain "accounts", but
+   the problem `instance` field is the request path. The response was correct; the assertion now checks
+   SQL-specific text.
+4. **Two compile errors in the AI's test code:** a helper method named `get` hid the static
+   `MockMvcRequestBuilders.get` import, and `assertThat` was ambiguous for `SQLException` (which is an
+   `Iterable`). Fixed.
+5. **AI test infrastructure mistake.** `LedgerConcurrencyIT` first used a pool of 30 connections. The
+   `ledgerline_app` role allows only 20 (Phase 2). Spring keeps test contexts cached, so the next context
+   (`LoginRateLimitIT`) failed to start: `FATAL: too many connections for role "ledgerline_app"`, 4 errors. **Fixed
+   without changing the role limit:** a pool of 10 and `@DirtiesContext` after the class. No assertion was changed.
+6. **AI decision during writing:** paging through the whole settlement statement in a test would get slower with
+   every run, because ledger rows are never deleted. The test now checks the settlement statement's last page, and
+   reconciliation checks all of its running balances.
+
+### Verification (actually run on 2026-11-10, Java 21)
+
+| Check | Result |
+|---|---|
+| `./mvnw clean test` | 289 unit tests, 0 failures, BUILD SUCCESS (228 before Phase 5) |
+| `./mvnw clean verify -Pintegration-tests` | 289 unit and 110 integration tests, 0 failures, BUILD SUCCESS (59 integration tests before) |
+| `LedgerConcurrencyIT` (21 runs including repetitions) | 50 × ₹10 withdrawals against ₹100: exactly 10 posted, 40 refused with balance 0, final balance 0 (5 of 5 repetitions). 20 identical requests: 1 posting, 19 replays, identical bodies (5 of 5). Same key with two amounts: 1 posting, 10 × 201 and 10 × 409 (3 of 3). 40 + 40 opposite transfers: 80 × 201, no 503, balances unchanged (3 of 3). 120 random mixed operations: only 201 or 422, money conserved, every statement consistent, reconciliation consistent (3 of 3). Lock timeout: 503, no key committed, the same key then posts once. Waiting duplicate after a rollback: posts once. |
+| `LedgerTriggerIT` (14) | Every invalid journal or key state failed at commit with 23514 and left no rows; a valid hand-built posting committed and reconciled; reconciliation detected tampering with triggers disabled (rolled back) |
+| `LedgerSchemaIT` (6), `LedgerApiIT` (10) | Runtime-role privileges, append-only for the owner, function security, direct-call checks, the role matrix, foreign 404s, refusals, limits, replays, statements, reconciliation |
+
+V5 was applied to `ledgerline_test_db` only, by the integration tests. `ledgerline_db` has not been migrated.
+Nothing was staged, committed or pushed.
+
+## Session 14: 2026-11-10, Phase 5 (V5 audit and V6 hardening)
+
+Commit reference: pending. Phase 5 is not committed yet; the latest commit is `1387fad` (Phase 4).
+
+**Prompts (summary):** a focused source-level audit of `V5__create_ledger.sql`, then "implement the necessary
+corrections in one consolidated pass" in a new migration V6, without editing V5 (already applied to
+`ledgerline_test_db`) and without migrating `ledgerline_db`.
+
+**Audit findings (the AI's audit of its own V5 code):**
+- **M1:** statement times used `now()`, which is the transaction start, so a request that waited for a lock could
+  show an earlier time than the line before it.
+- **L2:** the initiator's role and enabled flag were read without a lock.
+- **L3:** the commit-time checks did not tie an outcome to its key's user and operation, or a refusal to an owned
+  customer account.
+- **L4:** a second SYSTEM account was possible.
+- **L5:** session settings leaked into the caller's transaction.
+- **L6:** several postings in one transaction could deadlock or hold locks while idle.
+- **L7:** a NULL and an empty description hashed the same.
+- **L8:** total deposits are not capped.
+- No Critical or High findings beyond the documented shared-role limitation.
+
+**V6 (`V6__harden_ledger.sql`), V5 unchanged:**
+- M1: `clock_timestamp()` taken after the account locks and stored explicitly in `posted_at`, `attempted_at` and
+  `created_at`.
+- L2: the initiator's row is read `FOR SHARE`.
+- L3: `ledger_check_key_outcome`, `ledger_check_journal` and `ledger_check_refusal` replaced with stricter
+  versions.
+- L4: a check that a SYSTEM account must have the settlement id, plus a partial unique index.
+- L7: empty descriptions rejected (function and table checks). The fingerprint formula is unchanged, so existing
+  keys still replay.
+- L5: the caller's `lock_timeout` is restored; `SET CONSTRAINTS` names only the ledger triggers.
+- L6: `idle_in_transaction_session_timeout = 30s` for the caller's transaction; the remaining deadlock risk is
+  documented.
+- L8: documented, not changed.
+- `CREATE OR REPLACE` keeps each function's owner and privileges; `LedgerSchemaIT`'s catalog checks pass after V6.
+
+**Rehearsal before applying:** V6 was first run in a rolled-back transaction on `ledgerline_test_db` (which had
+V1–V5). It applied cleanly: two postings in one transaction worked, the caller's `lock_timeout` of `7s` was
+restored, the idle timeout read `30s`, reconciliation reported 0 differences, and an empty description was
+rejected with LL400.
+
+**Tests added:**
+- `LedgerTriggerIT` (+6): a key from another user; a key for another operation; a journal on a stranger's account;
+  a refusal on the settlement account; a refusal on someone else's account; a second SYSTEM account.
+- `LedgerSchemaIT` (+2): two postings in one transaction with the settings restored and the 30 s idle limit; a
+  role change committed while a posting waits on the user row (the posting waited, then refused with LL403).
+- `LedgerConcurrencyIT` (+1, repeated 3 times): 20 simultaneous deposits on 20 accounts; the settlement
+  account's times never decrease along its sequence.
+- `LedgerApi.assertStatementConsistent` now also requires times that never decrease along the sequence, in every
+  statement check.
+- `LedgerControllerTest` (+1): blank and empty descriptions reach the service as null.
+- `LedgerSchemaIT`: an empty description gives LL400.
+- `DatabaseRolesIT` now expects migrations 1–6.
+
+**Mistakes in this session:**
+1. **AI script error:** the AI's Python editing script first failed with a syntax error (nested triple quotes)
+   before changing anything. It was checked that no file had changed, then rerun.
+2. **AI test mistake:** `LedgerTriggerIT.aJournalWhoseAccountKindsDoNotMatchItsTypeFailsAtCommit` built a TRANSFER
+   journal on a DEPOSIT key. After V6 the commit was still rejected, but by the new key check, so the
+   message-specific assertion failed. Fixed by giving it a TRANSFER key, so it again checks the account-kind rule.
+   No assertion was weakened.
+
+**Verification (actually run on 2026-11-10, Java 21):**
+
+| Check | Result |
+|---|---|
+| `./mvnw clean test` | 290 unit tests, 0 failures, BUILD SUCCESS |
+| `./mvnw clean verify -Pintegration-tests` | 290 unit and 121 integration tests, 0 failures, BUILD SUCCESS (110 before) |
+| Flyway history | `ledgerline_test_db`: V1–V6, all successful. `ledgerline_db`: V1–V3 only (not migrated) |
+| `git diff --check` | no output; untracked files have no trailing whitespace |
+
+Nothing was staged, committed or pushed.

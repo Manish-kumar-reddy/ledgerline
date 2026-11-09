@@ -118,7 +118,7 @@ class AccountTablePrivilegesIT {
                 from information_schema.column_privileges
                 where table_name = 'accounts' and grantee = current_user
                 group by privilege_type order by privilege_type""", String.class))
-                .containsExactly("INSERT:id,name,owner_id", "SELECT:created_at,currency,id,name,owner_id,status");
+                .containsExactly("INSERT:id,name,owner_id", "SELECT:balance_minor,created_at,currency,id,kind,last_seq,name,owner_id,status");
         for (String privilege : new String[] {"UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER"}) {
             assertThat(appJdbc.queryForObject("select has_table_privilege(current_user, 'accounts', ?)", Boolean.class, privilege))
                     .as(privilege).isFalse();

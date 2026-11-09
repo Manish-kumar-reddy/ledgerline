@@ -266,7 +266,7 @@ class AccountAuthorizationIT {
         UUID account = newAccount(holder, "Plain");
         String body = call(get("/api/oversight/accounts/" + account), user("AUDITOR")).andReturn().getResponse().getContentAsString();
         assertThat(JsonPath.<Map<String, Object>>read(body, "$").keySet())
-                .containsExactlyInAnyOrder("id", "ownerId", "name", "currency", "status", "createdAt");
+                .containsExactlyInAnyOrder("id", "ownerId", "kind", "name", "currency", "status", "balance", "balanceMinor", "createdAt");
         assertThat(body).doesNotContain(holder.email()).doesNotContain("$2");
     }
 

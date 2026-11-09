@@ -4,7 +4,10 @@ import java.time.Duration;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
+import org.apache.commons.logging.Log;
+import org.apache.commons.logging.LogFactory;
 import org.springframework.beans.TypeMismatchException;
+import org.springframework.dao.DataAccessException;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.HttpStatusCode;
@@ -23,6 +26,8 @@ import org.springframework.web.servlet.mvc.method.annotation.ResponseEntityExcep
  */
 @RestControllerAdvice
 public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
+
+    private static final Log log = LogFactory.getLog(GlobalExceptionHandler.class);
 
     /** One message for every login failure: unknown email, wrong password or disabled account. */
     static final String LOGIN_FAILED = "Invalid email or password";
@@ -67,6 +72,44 @@ public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
         problem.setDetail("Parameter '" + (ex.getPropertyName() == null ? "value" : ex.getPropertyName())
                 + "' has an invalid format.");
         return ResponseEntity.badRequest().body(problem);
+    }
+
+    @ExceptionHandler(IdempotencyConflictException.class)
+    ProblemDetail idempotencyConflict(IdempotencyConflictException ex) {
+        ProblemDetail problem = ProblemDetail.forStatus(HttpStatus.CONFLICT);
+        problem.setTitle("Idempotency key reused");
+        problem.setDetail("This Idempotency-Key was already used for a different request. Nothing was posted.");
+        return problem;
+    }
+
+    /** Nothing was committed (not even the idempotency key), so the client may retry with the same key. */
+    @ExceptionHandler(LedgerBusyException.class)
+    ResponseEntity<ProblemDetail> ledgerBusy(LedgerBusyException ex) {
+        ProblemDetail problem = ProblemDetail.forStatus(HttpStatus.SERVICE_UNAVAILABLE);
+        problem.setTitle("Ledger busy");
+        problem.setDetail("Nothing was posted. Retry with the same Idempotency-Key.");
+        return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE).header(HttpHeaders.RETRY_AFTER, "1").body(problem);
+    }
+
+    @ExceptionHandler(InvalidLedgerRequestException.class)
+    ProblemDetail invalidLedgerRequest(InvalidLedgerRequestException ex) {
+        ProblemDetail problem = ProblemDetail.forStatus(HttpStatus.BAD_REQUEST);
+        problem.setTitle("Invalid request");
+        problem.setDetail(ex.getMessage());
+        return problem;
+    }
+
+    /**
+     * Any database error not handled above: a generic 500. The SQL, constraint names and values stay in the server
+     * log; none of it reaches the client.
+     */
+    @ExceptionHandler(DataAccessException.class)
+    ProblemDetail databaseError(DataAccessException ex) {
+        log.error("Database error while handling a request", ex);
+        ProblemDetail problem = ProblemDetail.forStatus(HttpStatus.INTERNAL_SERVER_ERROR);
+        problem.setTitle("Internal error");
+        problem.setDetail("The request could not be completed.");
+        return problem;
     }
 
     @ExceptionHandler(EmailAlreadyRegisteredException.class)

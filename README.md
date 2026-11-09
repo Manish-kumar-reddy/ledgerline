@@ -74,6 +74,8 @@ against the tables (`spring.jpa.hibernate.ddl-auto=validate`).
 | `V2__assert_public_schema_privileges.sql` | Fails the migration unless V1 really took effect (reads the schema ACL, where PUBLIC is grantee 0), and checks the app role is not the owner, a superuser or a member of the schema owner |
 | `V3__create_users.sql` | The `users` table and the app role's privileges on it (below) |
 | `V4__create_accounts.sql` | The `accounts` table and the app role's privileges on it (below) |
+| `V5__create_ledger.sql` | Balances, the double-entry ledger, idempotency keys, refused attempts, statement lines, invariant triggers, the posting functions and reconciliation (see Ledger) |
+| `V6__harden_ledger.sql` | Hardening after the V5 audit: statement times taken after the locks, the initiator's user row locked while posting, stronger outcome checks, a single SYSTEM account, no empty descriptions, restored session settings (see Ledger) |
 
 **What `ledgerline_app` may do on `users`** (verified with real SQL attempts in `UserTablePrivilegesIT`):
 
@@ -85,23 +87,25 @@ against the tables (`spring.jpa.hibernate.ddl-auto=validate`).
 Check constraints also make PostgreSQL reject a password that is not a BCrypt hash, an email that is not
 trimmed and lower-case, and a blank name.
 
-**The `accounts` table** (V4): `id`, `owner_id` (foreign key to `users.id`, `ON DELETE RESTRICT`), `name`
-(1–100 characters, not blank), `currency` (default `INR`), `status` (default `ACTIVE`; `FROZEN` and `CLOSED` are
-allowed values but nothing sets them yet) and `created_at`. There is **no balance column**: balances will be
-derived from ledger entries in a later phase. **INR only:** a check constraint allows no other currency, even for
-the owner role; supporting more currencies would be a deliberate migration.
+**The `accounts` table** (V4, extended by V5): `id`, `owner_id` (foreign key to `users.id`), `kind`
+(`CUSTOMER`, or `SYSTEM` for the single simulated settlement account, which has no owner), `name` (1–100
+characters, not blank), `currency` (default `INR`), `status` (default `ACTIVE`; `FROZEN` and `CLOSED` can only be
+set by the database owner), `balance_minor` (paise, maintained only by the posting functions), `last_seq` (number
+of statement lines) and `created_at`. Check constraints: a customer balance is between 0 and 1,000,000,000 paise;
+the settlement balance is never positive. **INR only:** a check constraint allows no other currency, even for the
+owner role; supporting more currencies would be a deliberate migration.
 
 **What `ledgerline_app` may do on `accounts`** (verified in `AccountTablePrivilegesIT`):
 
 | Allowed | Refused by PostgreSQL |
 |---|---|
-| `SELECT` | `UPDATE` of any column, including `owner_id` and `status` |
-| `INSERT` of `id`, `owner_id`, `name` only. `currency`, `status` and `created_at` always take their defaults. | `INSERT` naming `currency`, `status` or `created_at`; `DELETE`; `TRUNCATE`; `ALTER`/`DROP` |
+| `SELECT` | `UPDATE` of any column, including `owner_id`, `status` and `balance_minor` |
+| `INSERT` of `id`, `owner_id`, `name` only. Everything else takes its default (a new account is always an empty `CUSTOMER` account). | `INSERT` naming any other column; `DELETE`; `TRUNCATE`; `ALTER`/`DROP` |
 
 PUBLIC has no privileges on the table. The foreign key is checked by PostgreSQL as the table owner, so the app
 role needs no extra privilege on `users`. The database cannot tell *which* user is making a request, so it does
 not check that `owner_id` is the caller: the application does (see Authorization). Row-level security is not used
-yet (see Known limitations).
+(see Known limitations). The ledger tables are described under Ledger.
 
 **Migration placeholder safety.** Migrations use the `${app_role}` Flyway placeholder for the runtime role's
 name. Flyway substitutes it as raw text, so `MigrationRoleValidator` checks it in Java before Flyway runs: it
@@ -282,14 +286,15 @@ keep Jackson's default and ignore unknown properties. `StrictJsonModule` enforce
 | `GET /api/oversight/accounts/{id}` | 401 | 403 | 200 or 404 | 200 or 404 |
 | Any other method or path (e.g. `PUT`/`DELETE` on an account) | 401 | 403 | 403 | 403 |
 
-- An account is `{"id","ownerId","name","currency","status","createdAt"}`. No user name, email or hash is ever
-  included, and there is no balance.
+- An account is `{"id","ownerId","kind","name","currency","status","balance","balanceMinor","createdAt"}`
+  (`balance` is rupees as a string, `balanceMinor` paise). No user name, email or hash is ever included. The
+  oversight list also shows the settlement account (`kind: SYSTEM`, no owner).
 - Lists are pages: `{"items":[…],"page","size","totalItems","totalPages"}`, oldest first. `page` is 0–10,000
   (default 0) and `size` is 1–100 (default 20); anything else, or a non-number, is 400. The sort order is fixed.
 - Creating an account accepts only `name`. `ownerId`, `id`, `currency`, `status`, `role` or any other property
   gives 400 and nothing is created. Currency is always INR and status always ACTIVE.
 - A malformed id is 400; the response does not repeat it.
-- ADMIN and AUDITOR are read-only in this phase and cannot open customer accounts. There is no API to change a
+- ADMIN and AUDITOR are read-only and cannot open customer accounts or move money. There is no API to change a
   role, freeze, close or delete an account, or list users.
 
 ```bash
@@ -297,6 +302,183 @@ curl -X POST localhost:8080/api/accounts -H "Authorization: Bearer <token>" -H '
   -d '{"name":"Savings"}'
 curl localhost:8080/api/accounts -H "Authorization: Bearer <token>"
 ```
+
+
+## Ledger (Phase 5): balances, money movement and statements
+
+### Financial model
+
+Conventional **double-entry bookkeeping**, from the books of the (simulated) bank, recorded in one consistent
+signed form:
+
+- Every journal transaction has exactly **one DEBIT and one CREDIT of the same amount on two different accounts**.
+- Every account's balance is defined the same way: **balance = credits − debits**, in paise (`bigint`).
+  - A **customer account** is money the bank owes the customer (a liability): a credit increases it, and it can
+    never go below 0 (no overdraft).
+  - **`SETTLEMENT_CASH`** (`a0000000-0000-4000-8000-000000000001`) is the simulated external cash account (an
+    asset). It is not connected to any real bank. With the same definition its balance is never positive; its
+    magnitude is the cash held. In conventional terms that is a debit balance of the same size.
+- Because every transaction's debits equal its credits, **the sum of all balances is always 0**.
+
+Worked example (start A = 0, B = 0, CASH = 0; amounts in paise). This exact sequence is an integration test
+(`LedgerApiIT.theWorkedExampleFromTheReadme`):
+
+| Transaction | Entry | Direction | Signed change | Balance after | Total of all balances |
+|---|---|---|---|---|---|
+| Deposit ₹500 into A | CASH | DEBIT 50,000 | −50,000 | CASH −50,000 | |
+| | A | CREDIT 50,000 | +50,000 | A 50,000 | 0 → 0 |
+| Withdraw ₹200 from A | A | DEBIT 20,000 | −20,000 | A 30,000 | |
+| | CASH | CREDIT 20,000 | +20,000 | CASH −30,000 | 0 → 0 |
+| Transfer ₹100 A → B | A | DEBIT 10,000 | −10,000 | A 20,000 | |
+| | B | CREDIT 10,000 | +10,000 | B 10,000 | 0 → 0 |
+
+Final: A 20,000 + B 10,000 + CASH −30,000 = 0.
+
+Allowed shapes (enforced at commit): DEPOSIT = SYSTEM debit, CUSTOMER credit; WITHDRAWAL = CUSTOMER debit,
+SYSTEM credit; TRANSFER = CUSTOMER debit, CUSTOMER credit.
+
+**Money format:** amounts are JSON **strings** of rupees with at most 2 decimals (`"1500.50"`), converted exactly
+to paise. A JSON number (`1500.5`), zero, a negative, more than 2 decimals or an exponent is 400. There is no
+floating point anywhere.
+
+### Money limits
+
+| Rule | Value | Where enforced |
+|---|---|---|
+| Maximum single operation | ₹10,00,000.00 (100,000,000 paise) | posting function (refusal `AMOUNT_LIMIT_EXCEEDED`) and a check constraint |
+| Maximum customer balance | ₹1,00,00,000.00 (1,000,000,000 paise) | posting function (refusal `BALANCE_LIMIT_EXCEEDED`, or `DESTINATION_UNAVAILABLE` for a transfer recipient) and a check constraint |
+| No overdraft | balance ≥ 0 | posting function (refusal `INSUFFICIENT_FUNDS`) and a check constraint |
+| Settlement account | balance ≤ 0 | check constraint |
+| Currency | INR only | check constraints |
+
+### API
+
+| Method and path | No token | ACCOUNT_HOLDER | ADMIN | AUDITOR |
+|---|---|---|---|---|
+| `POST /api/accounts/{id}/deposits` `{"amount","description"?}` + `Idempotency-Key` | 401 | own account (else 404) | 403 | 403 |
+| `POST /api/accounts/{id}/withdrawals` (same body) | 401 | own account (else 404) | 403 | 403 |
+| `POST /api/accounts/{id}/transfers` `{"toAccountId","amount","description"?}` + `Idempotency-Key` | 401 | from own account to an active customer account | 403 | 403 |
+| `GET /api/accounts/{id}/statement?page=&size=` | 401 | own account (else 404) | 403 | 403 |
+| `GET /api/oversight/accounts/{id}/statement?page=&size=` | 401 | 403 | any account, incl. settlement | any account, incl. settlement |
+| `GET /api/oversight/reconciliation` | 401 | 403 | 200 | 200 |
+
+Response codes for money requests:
+
+| Code | Meaning |
+|---|---|
+| 201 | Posted. Body: `outcome: POSTED`, `transactionId`, `amount`, `balance` (the caller's account after), `sequence`, `initiatedBy`, `counterpartyAccountId`. |
+| 422 | Refused and **recorded on the caller's statement**. Body: `outcome: REFUSED`, `reason` (`INSUFFICIENT_FUNDS`, `ACCOUNT_NOT_ACTIVE`, `DESTINATION_UNAVAILABLE`, `AMOUNT_LIMIT_EXCEEDED`, `BALANCE_LIMIT_EXCEEDED`), unchanged `balance`. No journal transaction is created. |
+| 409 | The `Idempotency-Key` was already used for a different request. Nothing posted or recorded. |
+| 503 + `Retry-After: 1` | The account locks could not be obtained in 3 s. Nothing committed, not even the key: retry with the same key. |
+| 400 | Invalid body, amount, key (1–100 printable ASCII characters, required), a transfer to the same account, or any extra field (e.g. `initiatorId`). |
+| 404 | Not your account; identical to an account that does not exist. |
+| 500 | Unexpected server or database error; the response never contains SQL, constraint names or values. |
+
+A replay of the same key returns the original status and body, plus `Idempotent-Replayed: true`.
+
+```bash
+curl -X POST localhost:8080/api/accounts/<id>/deposits -H "Authorization: Bearer <token>" \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: 8f6c0e1a-deposit-1' -d '{"amount":"500.00"}'
+curl -X POST localhost:8080/api/accounts/<id>/transfers -H "Authorization: Bearer <token>" \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: 8f6c0e1a-transfer-1' \
+  -d '{"toAccountId":"<other id>","amount":"100.00","description":"rent"}'
+curl localhost:8080/api/accounts/<id>/statement -H "Authorization: Bearer <token>"
+```
+
+**Statements** list every posted DEBIT and CREDIT and every refused attempt of the account, in its own sequence
+order (1, 2, 3, … with no gaps), each with the **running balance** (stored at posting time under the row lock; a
+refused line repeats the unchanged balance), the **initiator** (user id), the other account, the operation, the
+amount, the reason for refusals, the description and the time. The response also contains the account and its
+current balance. The initiator of a transfer received is the sender's user id; no names or emails are shown.
+
+**Reconciliation** recomputes everything from the raw rows and reports each difference: account balance vs.
+credits − debits, every running balance, journal debits vs. credits, sequence numbers vs. line counts, entries or
+refusals without a statement line, and the total of all balances (must be 0). `consistent: true` means none.
+
+### How posting works
+
+All money moves through three PostgreSQL functions, `ledger_deposit`, `ledger_withdraw` and `ledger_transfer`
+(V5). Each HTTP request is **one function call in one database transaction**, which contains the idempotency key,
+the locks, the outcome and the balance changes:
+
+1. Check the input (again; the API already did) and the initiator: an existing, enabled ACCOUNT_HOLDER.
+2. Insert the idempotency key (`ON CONFLICT DO NOTHING`, scoped to the user). If it already exists: a different
+   request is 409; the same request returns the stored outcome without taking any account lock.
+3. Lock the affected accounts with `SELECT … FOR UPDATE` **in ascending id order** (the customer account and the
+   settlement account, or both transfer accounts), so opposite transfers cannot deadlock. Lock timeout 3 s.
+4. Under the locks: the initiator must own the account being debited or deposited into, and it must be an active
+   customer account; then the business rules decide.
+5. Refused: one refused attempt and one statement line on the caller's account; its balance does not change.
+   Posted: one journal transaction, two ledger entries with their balances after, two statement lines and the two
+   balance updates.
+6. All invariant checks run before the function returns, and the transaction commits.
+
+Details added by V6:
+- The initiator's `users` row is read `FOR SHARE`. A concurrent role change or disable (`set-user-role.sql` uses
+  `FOR UPDATE`) either commits first, and the posting then sees the new role, or waits until the posting commits.
+- Each line's time (`posted_at`, `attempted_at`) is `clock_timestamp()` taken **after** the account locks, so on
+  every account the times never decrease as the sequence number increases. (With `now()`, a request that waited
+  for a lock would have shown a time earlier than the line before it.) Statements are still ordered by sequence;
+  a backwards jump of the server clock could still show a later line with an earlier time.
+- Session settings: the caller's `lock_timeout` is restored before returning; the function only switches its own
+  ledger constraint triggers to immediate and back to deferred. `idle_in_transaction_session_timeout` is set to
+  30 s for the rest of the caller's transaction, so a transaction that posts and then sits idle is ended and its
+  locks released.
+- An empty description is rejected (the API turns a blank description into "none"), so "none" and `""` can never
+  share an idempotency fingerprint.
+
+**Concurrency and idempotency behaviour:**
+
+| Situation | Result |
+|---|---|
+| Many withdrawals at once on one account | Serialised by the account row lock; each checks funds after taking it. No overdraft. |
+| Identical requests (same user and key) at once | The second waits on the first's uncommitted key; once it commits, it returns the stored result. Exactly one posting. |
+| Same key, different request | 409, even while the first is still running (after waiting for it). |
+| The first request rolls back (e.g. lock timeout) | Its key disappears; a waiting duplicate then posts normally. |
+| A refused request retried with the same key | The original refusal is returned, even if funds have arrived. Use a new key to try again. |
+| A→B and B→A at once | Both lock the lower id first: no deadlock. |
+| Lock timeout or deadlock | 503; everything rolled back, including the key; retrying with the same key is safe. |
+
+### Invariants enforced by PostgreSQL
+
+Deferred constraint triggers check the **final state at commit**; any failure rolls back the whole transaction:
+
+- **Journal:** exactly one DEBIT and one CREDIT, both equal to the journal amount, two different accounts, account
+  kinds matching the operation (a journal with no entries or one entry cannot commit).
+- **Balance chain:** each entry's balance after = the account's previous posted balance ± the amount (refused lines
+  are skipped), and the latest entry equals `accounts.balance_minor`. A balance changed without an entry fails at
+  commit. Hence balance = credits − debits for every account, including the settlement account.
+- **Sequence:** every posted or refused line has exactly one statement line; numbers per account are 1..n with no
+  gaps (`account_statement_lines` primary key plus an immediate gap check); `last_seq` = the highest number. The
+  counter is a column updated under the row lock, not a PostgreSQL sequence, so a rollback leaves no gap.
+- **Idempotency:** every key has exactly one outcome (a journal transaction or a refused attempt), made by the
+  key's user for the key's operation (V6).
+- **Ownership:** a journal's customer side, and every refused attempt, is on a CUSTOMER account owned by its
+  initiator (V6).
+- **One system account:** only the fixed settlement account can be `SYSTEM` (check plus unique index, V6).
+- **Append-only:** `UPDATE`, `DELETE` and `TRUNCATE` on the five ledger tables are rejected by triggers, even for
+  the owner. An account's id, owner, kind and creation time cannot change.
+
+### Database permissions (ledger)
+
+| Object | `ledgerline_app` | PUBLIC |
+|---|---|---|
+| `accounts` | `SELECT`; `INSERT (id, owner_id, name)`; no `UPDATE` (so no balance change) | none |
+| `journal_transactions`, `ledger_entries`, `refused_attempts`, `account_statement_lines` | `SELECT` only | none |
+| `idempotency_keys` | none | none |
+| `ledger_deposit`, `ledger_withdraw`, `ledger_transfer` | `EXECUTE` | none |
+| `ledger_reconciliation` (runs with the caller's rights, read-only) | `EXECUTE` | none |
+| Every other ledger function (internal checks, triggers, `ledger_post`, `ledger_outcome`) | none | none |
+
+The posting functions are `SECURITY DEFINER`, owned by the migration role, with `search_path = pg_catalog,
+pg_temp`, fully qualified table names and no dynamic SQL. `LedgerSchemaIT` checks all of this from the catalog.
+
+**Trust boundary.** The posting functions check the initiator id they are **given**. All requests share one
+database role, so PostgreSQL cannot know which HTTP user is calling. The application passes only the
+authenticated user's id (`CurrentUser`; there is no request field for it). Someone with the `ledgerline_app`
+credentials, or able to run SQL through the application, could post as any account holder; they still could not
+break conservation, overdraw, exceed limits, or change or delete ledger rows, and every posting records its
+initiator. See THREATS.md.
 
 ### Authorization
 
@@ -423,15 +605,32 @@ limiter is full. Memory: roughly 20 MB per 100,000 keys per limiter (a rough loc
 - **Token storage in the browser** is decided in Phase 9; the plan is memory only, not `localStorage`.
 - **Local PostgreSQL uses `trust` authentication** (see above), so database passwords are not verified locally.
 - **Accounts (Phase 4):**
-  - Ownership is enforced by the application, not by PostgreSQL. The app role may insert any existing user's id as
-    `owner_id`; only the Java code ensures it is the caller. Row-level security, which would let the database
-    enforce it, is not used yet.
+  - Ownership of a new account is enforced by the application, not by PostgreSQL. The app role may insert any
+    existing user's id as `owner_id`; only the Java code ensures it is the caller. Row-level security is not used.
   - "Staff cannot open accounts" is likewise enforced by the application (URL rule and `@PreAuthorize`), not by a
     database constraint.
   - There is no limit on how many accounts a holder can open.
   - The largest allowed page offset (page 10,000 × size 100) makes PostgreSQL skip up to a million rows.
-  - Deferred to later phases: balances, deposits, withdrawals, transfers, ledger entries, freezing and closing
-    accounts, listing users, and admin actions. No API changes roles; `set-user-role.sql` remains the only way.
+  - Not implemented: freezing, closing or deleting accounts through the API (the database owner can set `status`),
+    listing users, and admin actions. No API changes roles; `set-user-role.sql` remains the only way.
+- **Ledger (Phase 5):**
+  - The posting functions trust the initiator id the application gives them (see Ledger, "Trust boundary").
+  - Every deposit and withdrawal locks the single settlement account row, so they are serialised across the whole
+    system. Transfers between customers are not. Fine for a demo; a high-volume system would need a different design.
+  - Idempotency keys are kept forever (no expiry). A refused key cannot be reused, even after funds arrive.
+  - A transfer's destination is any active customer account id; a refusal (`DESTINATION_UNAVAILABLE`) or success
+    tells the sender whether an id is an active account.
+  - An account holder can fill their own statement with refused attempts (each needs a new key); there is no rate
+    limit on money requests yet.
+  - Statements and reconciliation use offset paging and full scans: fine for demo volumes, not for millions of rows.
+  - Ledger rows can never be deleted, so the test database grows with every integration-test run.
+  - Deposits and withdrawals are simulated: no real bank or payment provider is involved. **The total of simulated
+    deposits is not capped**: each operation is capped and each account balance is capped, but a holder can open
+    any number of accounts and deposit again over time, so the simulated cash in the system has no upper bound.
+  - Several posting calls inside one database transaction (only possible with direct database access; the API uses
+    one transaction per call) are each deadlock-free on their own, but their combined locks are not taken in one
+    global order, so they can deadlock with each other (PostgreSQL detects it and rolls one back). The 30 s idle
+    limit bounds how long such a transaction can hold locks while idle.
 
 ## Tests
 
@@ -451,6 +650,25 @@ npm run lint && npm run build
   run (`RandomJwtSecret`), so no test key is stored in the repository.
 - Integration tests that must act as the database owner (disabling a user, changing a role) use `OwnerJdbc`,
   which re-checks the guarded test URL before connecting.
+- Ledger (Phase 5), all against real PostgreSQL:
+  - `LedgerConcurrencyIT`: real parallel HTTP requests released together, with a pool of 10 database
+    connections. 50 simultaneous ₹10 withdrawals against ₹100 (exactly 10 succeed, 40 refused; 5 repetitions);
+    20 identical requests with one key (exactly one posting, 19 replays; 5 repetitions); one key with two different
+    amounts at once (one posting, 10 conflicts); 40 + 40 opposite transfers (all succeed, no deadlock); 120 random
+    mixed operations (conservation, statements, reconciliation; 3 repetitions); lock timeout rolls back the
+    posting and the key; a waiting duplicate posts after the first rolls back.
+  - `LedgerTriggerIT`: rows written directly as the owner: a journal with no entries, one entry, unequal sides,
+    wrong amounts, a key with no or two outcomes, a broken balance chain, wrong account kinds, a balance changed
+    without an entry, a statement gap; each fails and leaves nothing. A valid hand-built posting commits.
+    Reconciliation detects tampering when triggers are bypassed (in a rolled-back transaction).
+  - `LedgerSchemaIT`: what the runtime role can and cannot do; append-only even for the owner; function
+    ownership, `search_path`, `SECURITY DEFINER` and `EXECUTE` grants; direct function calls with invalid input and
+    with non-owner, disabled, ADMIN, AUDITOR and unknown initiators.
+  - `LedgerApiIT`: the worked example, the role matrix, foreign accounts (same 404 as unknown, nothing recorded on
+    the victim), refusals, frozen accounts, limits, replays and conflicts, injected fields, statements and
+    reconciliation.
+- The `ledgerline_app` role allows 20 connections (`database/setup/create-database.sql`). Spring caches test
+  contexts and their pools, so `LedgerConcurrencyIT` uses its own pool of 10 and closes it after the class.
 - Authorization: `AccountAuthorizationIT` checks every role (and no token) against every account endpoint over
   HTTP with real PostgreSQL, plus cross-user 404s, list isolation, injected fields, disabled users, role changes
   with existing tokens and role claims in a validly signed token. `AccountMethodSecurityTest` checks

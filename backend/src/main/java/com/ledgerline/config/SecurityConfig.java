@@ -71,8 +71,14 @@ public class SecurityConfig {
                         // Account holders: their own accounts only (ownership enforced in AccountService).
                         .requestMatchers(HttpMethod.POST, "/api/accounts").hasRole("ACCOUNT_HOLDER")
                         .requestMatchers(HttpMethod.GET, "/api/accounts", "/api/accounts/*").hasRole("ACCOUNT_HOLDER")
+                        // Money movement and statements on the holder's own accounts (ownership in the services
+                        // and again in the PostgreSQL posting functions). ADMIN and AUDITOR never move money.
+                        .requestMatchers(HttpMethod.POST, "/api/accounts/*/deposits", "/api/accounts/*/withdrawals",
+                                "/api/accounts/*/transfers").hasRole("ACCOUNT_HOLDER")
+                        .requestMatchers(HttpMethod.GET, "/api/accounts/*/statement").hasRole("ACCOUNT_HOLDER")
                         // Read-only oversight of every account.
-                        .requestMatchers(HttpMethod.GET, "/api/oversight/accounts", "/api/oversight/accounts/*")
+                        .requestMatchers(HttpMethod.GET, "/api/oversight/accounts", "/api/oversight/accounts/*",
+                                "/api/oversight/accounts/*/statement", "/api/oversight/reconciliation")
                                 .hasAnyRole("ADMIN", "AUDITOR")
                         // Default deny: unlisted paths and methods (e.g. PUT/DELETE on an account) are refused.
                         .anyRequest().denyAll())
@@ -97,10 +103,10 @@ public class SecurityConfig {
             @Value("${ledgerline.cors.allowed-origins:http://localhost:5173}") List<String> allowedOrigins) {
         CorsConfiguration cors = new CorsConfiguration();
         cors.setAllowedOrigins(allowedOrigins);
-        // Only what the current API uses; later phases add methods/headers (e.g. Idempotency-Key) when needed.
+        // Only what the current API uses.
         cors.setAllowedMethods(List.of("GET", "POST", "OPTIONS"));
-        cors.setAllowedHeaders(List.of("Authorization", "Content-Type"));
-        cors.setExposedHeaders(List.of("Location"));
+        cors.setAllowedHeaders(List.of("Authorization", "Content-Type", "Idempotency-Key"));
+        cors.setExposedHeaders(List.of("Location", "Retry-After", "Idempotent-Replayed"));
         cors.setAllowCredentials(false);
         UrlBasedCorsConfigurationSource source = new UrlBasedCorsConfigurationSource();
         source.registerCorsConfiguration("/api/**", cors);

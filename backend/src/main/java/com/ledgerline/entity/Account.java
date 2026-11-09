@@ -13,7 +13,11 @@ import java.util.UUID;
 import org.hibernate.annotations.Generated;
 
 /**
- * A customer account (table {@code accounts}, created by V4). It holds no balance.
+ * An account (table {@code accounts}, V4 and V5). Customer accounts belong to an account holder; the single SYSTEM
+ * account is the simulated settlement cash and has no owner.
+ *
+ * The balance and the statement counter are read-only here: only the ledger posting functions in PostgreSQL change
+ * them (the runtime role has no UPDATE privilege on this table). balance = credits - debits, in paise.
  *
  * The application can only insert id, owner and name, matching the runtime role's column grants. Currency, status
  * and created_at always come from the database defaults ({@code insertable = false}) and are read back after the
@@ -29,7 +33,7 @@ public class Account {
     @Column(name = "id", nullable = false, updatable = false)
     private UUID id;
 
-    @Column(name = "owner_id", nullable = false, updatable = false)
+    @Column(name = "owner_id", updatable = false)
     private UUID ownerId;
 
     @Column(name = "name", nullable = false, length = 100, updatable = false)
@@ -47,6 +51,19 @@ public class Account {
     @Generated
     @Column(name = "created_at", nullable = false, insertable = false, updatable = false)
     private Instant createdAt;
+
+    @Generated
+    @Enumerated(EnumType.STRING)
+    @Column(name = "kind", nullable = false, length = 10, insertable = false, updatable = false)
+    private AccountKind kind;
+
+    @Generated
+    @Column(name = "balance_minor", nullable = false, insertable = false, updatable = false)
+    private Long balanceMinor;
+
+    @Generated
+    @Column(name = "last_seq", nullable = false, insertable = false, updatable = false)
+    private Long lastSeq;
 
     protected Account() {
         // For JPA.
@@ -80,6 +97,20 @@ public class Account {
 
     public Instant getCreatedAt() {
         return createdAt;
+    }
+
+    public AccountKind getKind() {
+        return kind;
+    }
+
+    /** Paise; never null once read from the database. */
+    public long getBalanceMinor() {
+        return balanceMinor == null ? 0 : balanceMinor;
+    }
+
+    /** Number of statement lines (posted and refused). */
+    public long getLastSeq() {
+        return lastSeq == null ? 0 : lastSeq;
     }
 
     @Override
