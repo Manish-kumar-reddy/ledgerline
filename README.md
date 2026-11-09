@@ -73,6 +73,7 @@ against the tables (`spring.jpa.hibernate.ddl-auto=validate`).
 | `V1__restrict_public_schema.sql` | Only the owner may create objects in schema `public`; the app role gets `USAGE` |
 | `V2__assert_public_schema_privileges.sql` | Fails the migration unless V1 really took effect (reads the schema ACL, where PUBLIC is grantee 0), and checks the app role is not the owner, a superuser or a member of the schema owner |
 | `V3__create_users.sql` | The `users` table and the app role's privileges on it (below) |
+| `V4__create_accounts.sql` | The `accounts` table and the app role's privileges on it (below) |
 
 **What `ledgerline_app` may do on `users`** (verified with real SQL attempts in `UserTablePrivilegesIT`):
 
@@ -83,6 +84,24 @@ against the tables (`spring.jpa.hibernate.ddl-auto=validate`).
 
 Check constraints also make PostgreSQL reject a password that is not a BCrypt hash, an email that is not
 trimmed and lower-case, and a blank name.
+
+**The `accounts` table** (V4): `id`, `owner_id` (foreign key to `users.id`, `ON DELETE RESTRICT`), `name`
+(1–100 characters, not blank), `currency` (default `INR`), `status` (default `ACTIVE`; `FROZEN` and `CLOSED` are
+allowed values but nothing sets them yet) and `created_at`. There is **no balance column**: balances will be
+derived from ledger entries in a later phase. **INR only:** a check constraint allows no other currency, even for
+the owner role; supporting more currencies would be a deliberate migration.
+
+**What `ledgerline_app` may do on `accounts`** (verified in `AccountTablePrivilegesIT`):
+
+| Allowed | Refused by PostgreSQL |
+|---|---|
+| `SELECT` | `UPDATE` of any column, including `owner_id` and `status` |
+| `INSERT` of `id`, `owner_id`, `name` only. `currency`, `status` and `created_at` always take their defaults. | `INSERT` naming `currency`, `status` or `created_at`; `DELETE`; `TRUNCATE`; `ALTER`/`DROP` |
+
+PUBLIC has no privileges on the table. The foreign key is checked by PostgreSQL as the table owner, so the app
+role needs no extra privilege on `users`. The database cannot tell *which* user is making a request, so it does
+not check that `owner_id` is the caller: the application does (see Authorization). Row-level security is not used
+yet (see Known limitations).
 
 **Migration placeholder safety.** Migrations use the `${app_role}` Flyway placeholder for the runtime role's
 name. Flyway substitutes it as raw text, so `MigrationRoleValidator` checks it in Java before Flyway runs: it
@@ -252,6 +271,58 @@ never the rejected value.
 property they do not define (for example `"role"`) gives 400. This is per type, not global: other request types
 keep Jackson's default and ignore unknown properties. `StrictJsonModule` enforces it.
 
+## Accounts API (Phase 4)
+
+| Method and path | Anonymous | ACCOUNT_HOLDER | ADMIN | AUDITOR |
+|---|---|---|---|---|
+| `POST /api/accounts` body `{"name":"…"}` | 401 | 201, owned by the caller, `Location: /api/accounts/{id}` | 403 | 403 |
+| `GET /api/accounts?page=&size=` | 401 | 200, own accounts only | 403 | 403 |
+| `GET /api/accounts/{id}` | 401 | 200 if own; **404** otherwise | 403 | 403 |
+| `GET /api/oversight/accounts?page=&size=` | 401 | 403 | 200, all accounts | 200, all accounts |
+| `GET /api/oversight/accounts/{id}` | 401 | 403 | 200 or 404 | 200 or 404 |
+| Any other method or path (e.g. `PUT`/`DELETE` on an account) | 401 | 403 | 403 | 403 |
+
+- An account is `{"id","ownerId","name","currency","status","createdAt"}`. No user name, email or hash is ever
+  included, and there is no balance.
+- Lists are pages: `{"items":[…],"page","size","totalItems","totalPages"}`, oldest first. `page` is 0–10,000
+  (default 0) and `size` is 1–100 (default 20); anything else, or a non-number, is 400. The sort order is fixed.
+- Creating an account accepts only `name`. `ownerId`, `id`, `currency`, `status`, `role` or any other property
+  gives 400 and nothing is created. Currency is always INR and status always ACTIVE.
+- A malformed id is 400; the response does not repeat it.
+- ADMIN and AUDITOR are read-only in this phase and cannot open customer accounts. There is no API to change a
+  role, freeze, close or delete an account, or list users.
+
+```bash
+curl -X POST localhost:8080/api/accounts -H "Authorization: Bearer <token>" -H 'Content-Type: application/json' \
+  -d '{"name":"Savings"}'
+curl localhost:8080/api/accounts -H "Authorization: Bearer <token>"
+```
+
+### Authorization
+
+The backend is the only authority; the frontend's view of a role is never trusted. Two independent layers:
+
+1. **URL rules, default deny** (`SecurityConfig`). Every endpoint is listed with its HTTP method and the roles
+   allowed. Anything not listed is refused for everyone: 403 with a valid token, 401 without one. So an unknown
+   path with a token is now 403, not 404.
+2. **Method security.** Every public method of `AccountService` (ACCOUNT_HOLDER) and `AccountOversightService`
+   (ADMIN or AUDITOR) has `@PreAuthorize`, so a service stays protected even if a future endpoint reached it
+   without a URL rule. A refusal there is a 403 (tested), never the login 401.
+
+Roles and the enabled flag are read from PostgreSQL on every request, so a role change or a disable applies to
+the next request made with an existing token. Role claims inside a token are ignored, even in a correctly signed
+one. ADMIN and AUDITOR are separate roles with no hierarchy: each grant is listed explicitly.
+
+**Ownership and IDOR protection:**
+- The owner of a new account is always the authenticated user, read from the security context in the service
+  (`CurrentUser`). No request, path or token claim can name an owner.
+- Every customer read uses an owner-scoped query (`findByIdAndOwnerId`, `findByOwnerId`). The customer service has
+  no way to load an account without the caller's id: `AccountRepository` exposes only the methods listed in it,
+  and the unscoped ones are used only by the oversight service.
+- Another user's account and an account that does not exist give the **same 404**: same status, title and
+  detail; only `instance`, the path the caller asked for, differs. So ids cannot be probed. Account ids are random UUIDs, but nothing relies on that: guessing an id gives nothing.
+- PostgreSQL refuses any change of an account's owner or status by the application (see Database setup).
+
 ### How authentication works
 
 - **Passwords:** 12 to 72 bytes in UTF-8 (BCrypt reads at most 72 bytes). Stored only as a BCrypt hash with cost
@@ -351,6 +422,16 @@ limiter is full. Memory: roughly 20 MB per 100,000 keys per limiter (a rough loc
 - **Registration reveals whether an email is registered** (409). Login does not.
 - **Token storage in the browser** is decided in Phase 9; the plan is memory only, not `localStorage`.
 - **Local PostgreSQL uses `trust` authentication** (see above), so database passwords are not verified locally.
+- **Accounts (Phase 4):**
+  - Ownership is enforced by the application, not by PostgreSQL. The app role may insert any existing user's id as
+    `owner_id`; only the Java code ensures it is the caller. Row-level security, which would let the database
+    enforce it, is not used yet.
+  - "Staff cannot open accounts" is likewise enforced by the application (URL rule and `@PreAuthorize`), not by a
+    database constraint.
+  - There is no limit on how many accounts a holder can open.
+  - The largest allowed page offset (page 10,000 × size 100) makes PostgreSQL skip up to a million rows.
+  - Deferred to later phases: balances, deposits, withdrawals, transfers, ledger entries, freezing and closing
+    accounts, listing users, and admin actions. No API changes roles; `set-user-role.sql` remains the only way.
 
 ## Tests
 
@@ -370,6 +451,11 @@ npm run lint && npm run build
   run (`RandomJwtSecret`), so no test key is stored in the repository.
 - Integration tests that must act as the database owner (disabling a user, changing a role) use `OwnerJdbc`,
   which re-checks the guarded test URL before connecting.
+- Authorization: `AccountAuthorizationIT` checks every role (and no token) against every account endpoint over
+  HTTP with real PostgreSQL, plus cross-user 404s, list isolation, injected fields, disabled users, role changes
+  with existing tokens and role claims in a validly signed token. `AccountMethodSecurityTest` checks
+  `@PreAuthorize` through the real Spring proxies, with method security enabled by the application's own
+  `SecurityConfig`. `AccountTablePrivilegesIT` checks the `accounts` privileges with real SQL.
 - `LoginRateLimitIT` and `RegistrationRateLimitIT` run with low limits in their own Spring contexts, and
   include real parallel bursts through the HTTP layer. The shared integration-test context raises the
   registration limit (`application-test.properties`), because other tests register many users from one address.

@@ -11,6 +11,7 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.http.HttpMethod;
 import org.springframework.security.config.Customizer;
+import org.springframework.security.config.annotation.method.configuration.EnableMethodSecurity;
 import org.springframework.security.config.annotation.web.builders.HttpSecurity;
 import org.springframework.security.config.annotation.web.configurers.AbstractHttpConfigurer;
 import org.springframework.security.config.http.SessionCreationPolicy;
@@ -28,8 +29,18 @@ import tools.jackson.databind.json.JsonMapper;
  *
  * CSRF protection is off because no cookie or session authenticates a request: a browser cannot attach the
  * bearer token to a forged cross-site request on its own.
+ *
+ * Authorization has two layers (README.md, "Authorization"):
+ * <ol>
+ *   <li>URL rules here, default deny: every endpoint must be listed with its method and who may call it; anything
+ *       not listed is refused (403, or 401 without a token).</li>
+ *   <li>{@code @PreAuthorize} on every service method ({@link EnableMethodSecurity}), so a service stays protected
+ *       even if a future endpoint reaches it without a matching URL rule.</li>
+ * </ol>
+ * Roles come from PostgreSQL on every request (UserJwtAuthenticationConverter), never from the token.
  */
 @Configuration(proxyBeanMethods = false)
+@EnableMethodSecurity
 @EnableConfigurationProperties({LoginRateLimitProperties.class, RegistrationRateLimitProperties.class})
 public class SecurityConfig {
 
@@ -56,7 +67,15 @@ public class SecurityConfig {
                         .requestMatchers(HttpMethod.GET, "/api/health").permitAll()
                         .requestMatchers(HttpMethod.POST, "/api/auth/register", "/api/auth/login").permitAll()
                         .requestMatchers("/error").permitAll()
-                        .anyRequest().authenticated())
+                        .requestMatchers(HttpMethod.GET, "/api/auth/me").authenticated()
+                        // Account holders: their own accounts only (ownership enforced in AccountService).
+                        .requestMatchers(HttpMethod.POST, "/api/accounts").hasRole("ACCOUNT_HOLDER")
+                        .requestMatchers(HttpMethod.GET, "/api/accounts", "/api/accounts/*").hasRole("ACCOUNT_HOLDER")
+                        // Read-only oversight of every account.
+                        .requestMatchers(HttpMethod.GET, "/api/oversight/accounts", "/api/oversight/accounts/*")
+                                .hasAnyRole("ADMIN", "AUDITOR")
+                        // Default deny: unlisted paths and methods (e.g. PUT/DELETE on an account) are refused.
+                        .anyRequest().denyAll())
                 .oauth2ResourceServer(resourceServer -> resourceServer
                         .jwt(jwt -> jwt.jwtAuthenticationConverter(userConverter))
                         .authenticationEntryPoint(entryPoint)

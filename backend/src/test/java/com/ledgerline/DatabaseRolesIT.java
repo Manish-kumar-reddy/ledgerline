@@ -56,7 +56,7 @@ class DatabaseRolesIT {
         assertThat(applied).isNotEmpty();
         assertThat(applied).allSatisfy(migration -> assertThat(migration.getInstalledBy()).isEqualTo(migrationRole));
         assertThat(applied).extracting(migration -> migration.getVersion().getVersion())
-                .containsExactly("1", "2", "3");
+                .containsExactly("1", "2", "3", "4");
     }
 
     @Test

@@ -971,3 +971,79 @@ proxies, never `framework`, proxy overwrites `X-Forwarded-For`, application port
 | `git diff --check` | no output (covers tracked files only; untracked Phase 3 files were checked separately for trailing whitespace: none) |
 
 No migration was changed. Nothing was staged, committed or pushed.
+
+---
+
+## Session 12: 2026-11-09 to 2026-11-10, Phase 4 (role-based authorization and account ownership)
+
+Commit reference: pending. Phase 4 is not committed yet; the latest commit is `89a9dd8` (Implement JWT
+authentication).
+
+### Prompt 1: plan only
+
+> We are starting Phase 4 of LedgerLine: Role-Based Authorization and Account Ownership… TASK — PLAN ONLY…
+> Cover: existing security configuration, endpoint access matrix, method-level authorization, account ownership,
+> ADMIN vs AUDITOR, IDOR, tests, database changes, documentation, exact files and risks.
+
+**What the AI did:** inspected `SecurityConfig`, the security classes, V1–V3, `set-user-role.sql` and the test
+layout. It found no role checks anywhere yet (no `@EnableMethodSecurity`), only the `users` table, and proposed
+an `accounts` table (no balance), separate customer (`/api/accounts`) and oversight (`/api/oversight/accounts`)
+endpoints, URL plus method security, owner-scoped queries with 404 for other users' accounts, a V4 migration with
+column-level grants, and the tests.
+
+### Prompt 2: approved implementation
+
+> Proceed with Phase 4 implementation… CHANGES TO YOUR ORIGINAL PLAN: Defer GET /api/admin/users… Do not accept
+> ownerId, account status, currency, or account ID from the client… Keep account operations read-only except
+> account creation… Keep ADMIN and AUDITOR read-only… Never add a role-promotion API. Verify that method-security
+> access-denied exceptions produce HTTP 403, not 401. Keep V1, V2 and V3 unchanged. Add only V4. Do not implement
+> PostgreSQL row-level security… Do not commit, push, deploy…
+
+**What the AI implemented:**
+- `V4__create_accounts.sql`: `accounts` (id, owner_id FK to users, name, currency default `INR` with a check that
+  allows only INR, status default `ACTIVE`, created_at; no balance). `REVOKE ALL ... FROM PUBLIC`; the app role
+  gets `SELECT` and `INSERT (id, owner_id, name)` only, using the existing validated placeholder and
+  `format('%I')`.
+- `Account`, `AccountStatus`, `AccountRepository` (a plain `Repository` exposing only the needed methods: no
+  delete, no generic save-as-update), `CreateAccountRequest` (only `name`, `@RejectUnknownProperties`, no control
+  characters), `AccountResponse` (no user details), `PageResponse`, `AccountNotFoundException`, `CurrentUser`.
+- `AccountService` (ACCOUNT_HOLDER; owner from the security context; owner-scoped queries only) and
+  `AccountOversightService` (ADMIN or AUDITOR; read-only), each method with `@PreAuthorize`.
+- `AccountController` and `OversightAccountController`; paging validated (page 0–10,000, size 1–100) by Spring
+  MVC's built-in method validation.
+- `SecurityConfig`: `@EnableMethodSecurity`; explicit rules per method and path; `anyRequest()` changed from
+  `authenticated()` to `denyAll()` (default deny). JWT, CORS and rate limiting unchanged.
+- `GlobalExceptionHandler`: 404 for `AccountNotFoundException`; a type-mismatch handler whose detail names the
+  parameter but not the rejected value (Spring's default repeats the value).
+- `DatabaseRolesIT`: the expected list of applied migrations now includes "4".
+- README: Accounts API and access matrix, Authorization (layers, ownership and IDOR), the `accounts` table and its
+  privileges, the INR-only assumption, limitations and deferred features, and the new tests.
+
+**Mistakes and errors in this session:**
+1. **AI test mistake.** `AccountControllerTest.aMalformedIdIs400AndIsNotEchoed` first asserted that the whole
+   400 body did not contain the malformed id. It failed: the handler's `detail` did not repeat the value, but every
+   problem response has `instance`, the requested path (URL-encoded), which does. The test was corrected to check
+   `title` and `detail`; the handler was not changed. The README states that `instance` is the requested path.
+2. **Expected failure, not a bug.** The first integration run failed in `DatabaseRolesIT` because it lists the
+   applied migrations exactly and now there is a V4. The same run showed V4 was installed by the migration role.
+   The expected list was updated.
+3. **AI wording mistake, corrected by the AI before reporting:** the README first said a foreign account and a
+   missing one give the "same body"; they differ in `instance` (the path). Corrected.
+4. **Added during the AI's self-review:** default deny could in principle block CORS preflight requests, and no
+   test covered them. A test was added: an allowed origin's preflight gets 200 with the CORS header; another
+   origin gets 403.
+
+**Verification (actually run on 2026-11-10, Java 21):** see the table below.
+
+| Check | Result |
+|---|---|
+| `./mvnw clean test`, database URLs pointed at an unused port | 228 unit tests, 0 failures, BUILD SUCCESS (197 before Phase 4) |
+| `./mvnw clean verify -Pintegration-tests` | 228 unit and 59 integration tests, 0 failures, BUILD SUCCESS (35 integration tests before) |
+| `AccountAuthorizationIT` (17) | Every role and no token against all five endpoints gave exactly the matrix in the README; PUT/PATCH/DELETE, POST on oversight, `/api/admin/users` and an unknown path were 403 with a token and 401 without; a foreign account and a random id gave the same 404 apart from `instance`; list isolation; `ownerId`, `role`, `status`, `currency` and `id` in the body each gave 400 with nothing created; disabled users got 401 with existing tokens; promotion and demotion applied on the next request; role claims in a token signed with the real key granted nothing |
+| `AccountTablePrivilegesIT` (7) | As `ledgerline_app`: inserts get INR and ACTIVE; inserting currency, status or created_at, any UPDATE (owner, status, name, currency), DELETE, TRUNCATE, ALTER and DROP were refused with 42501; an unknown owner gave 23503 and a blank name 23514; even the owner role cannot store USD or an unknown status (23514); PUBLIC has no privileges |
+| `AccountMethodSecurityTest` | The services are proxies; staff calling customer methods and holders calling oversight get `AccessDeniedException`, and the repository is never reached; with no authentication every method is refused |
+| `AccountControllerTest` | An `AuthorizationDeniedException` from the service becomes 403 "Forbidden", not 401; injected fields and invalid names are 400 before the service; paging limits; CORS preflight |
+| `git diff --check` | No output. It covers tracked files only; untracked files were checked separately: no trailing whitespace |
+
+V1, V2 and V3 are unchanged. V4 was applied to `ledgerline_test_db` only (by the integration tests);
+`ledgerline_db` has not been migrated. Nothing was staged, committed or pushed.
