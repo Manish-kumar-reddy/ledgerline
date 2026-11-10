@@ -1,10 +1,16 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Link, Navigate, useNavigate, useSearchParams } from 'react-router';
 import { homePathFor, useAuth } from '../auth/session.js';
 import { ErrorPanel, Field } from '../components/ui.jsx';
 import AuthLayout from './AuthLayout.jsx';
 
-export default function Login() {
+/** After this long without an answer, explain that the server may be starting (free hosting sleeps when idle). */
+export const SLOW_SIGN_IN_MS = 5000;
+
+const WAKING_HINT = 'If LedgerLine has not been used for a while, the server can take up to a minute to start. '
+  + 'Please wait, or try again shortly.';
+
+export default function Login({ slowAfterMs = SLOW_SIGN_IN_MS }) {
   const { user, login } = useAuth();
   const navigate = useNavigate();
   const [params] = useSearchParams();
@@ -12,6 +18,15 @@ export default function Login() {
   const [password, setPassword] = useState('');
   const [error, setError] = useState(null);
   const [busy, setBusy] = useState(false);
+  const [slow, setSlow] = useState(false);
+
+  useEffect(() => {
+    if (!busy) {
+      return undefined;
+    }
+    const timer = setTimeout(() => setSlow(true), slowAfterMs);
+    return () => clearTimeout(timer);
+  }, [busy, slowAfterMs]);
 
   if (user) {
     return <Navigate to={homePathFor(user)} replace />;
@@ -20,6 +35,7 @@ export default function Login() {
   async function submit(event) {
     event.preventDefault();
     setBusy(true);
+    setSlow(false);
     setError(null);
     try {
       const me = await login(email.trim(), password);
@@ -48,7 +64,8 @@ export default function Login() {
           <input id="password" type="password" autoComplete="current-password" value={password}
             onChange={(e) => setPassword(e.target.value)} required />
         </Field>
-        <ErrorPanel error={error} />
+        {busy && slow && <p className="panel panel--info" role="status">Still signing in… {WAKING_HINT}</p>}
+        <ErrorPanel error={error?.network ? { ...error, detail: WAKING_HINT } : error} />
         <button type="submit" className="button button--block" disabled={busy || !email || !password}>
           {busy ? 'Signing in…' : 'Sign in'}
         </button>

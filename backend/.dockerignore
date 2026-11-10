@@ -1,0 +1,15 @@
+# Only pom.xml, the Maven wrapper, src/main and docker-entrypoint.sh are needed to build the image.
+.env
+.env.*
+**/.env
+target/
+src/test/
+*.log
+.git
+.gitignore
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Dockerfile
+.dockerignore

@@ -132,3 +132,24 @@ test('the session lives only in memory: reloading signs out', async ({ page }) =
   await page.reload();
   await expect(page.getByRole('heading', { name: 'Sign in' })).toBeVisible();
 });
+
+test('the production security headers are served and the app runs under its Content-Security-Policy', async ({ page }) => {
+  const violations = [];
+  page.on('console', (message) => {
+    if (/Content Security Policy|Refused to (load|execute|apply|connect)/i.test(message.text())) violations.push(message.text());
+  });
+  const response = await page.goto('/accounts/some-deep-link');           // SPA fallback serves the app
+  const headers = response.headers();
+  expect(headers['content-security-policy']).toContain("default-src 'none'");
+  expect(headers['content-security-policy']).toContain("script-src 'self'");
+  expect(headers['content-security-policy']).not.toContain('unsafe');
+  expect(headers['content-security-policy']).toContain('connect-src \'self\' http://localhost:8081');
+  expect(headers['x-frame-options']).toBe('DENY');
+  await expect(page.getByRole('heading', { name: 'Sign in' })).toBeVisible();
+
+  const email = uniqueEmail('e2e-csp');
+  await register(page, 'CSP E2E', email);
+  await signIn(page, email);
+  await expect(page.getByRole('heading', { name: 'My accounts' })).toBeVisible();   // API calls allowed by connect-src
+  expect(violations).toEqual([]);
+});

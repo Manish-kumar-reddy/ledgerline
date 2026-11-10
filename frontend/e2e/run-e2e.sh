@@ -33,5 +33,7 @@ for _ in $(seq 1 90); do
 done
 curl -sf http://localhost:8081/api/health > /dev/null
 
-VITE_API_BASE_URL="http://localhost:8081" npm run build
+# Exported for both the build (bundled API URL) and `vite preview` (which serves vercel.json's CSP with this origin).
+export VITE_API_BASE_URL="http://localhost:8081"
+npm run build
 npx playwright test "$@"

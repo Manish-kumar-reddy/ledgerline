@@ -1287,3 +1287,173 @@ ledger and financial operations).
 | `git diff --check` | no output |
 
 Nothing was staged, committed or pushed.
+
+---
+
+## Session 16: 2026-11-11, Phase 7 (deployment readiness)
+
+Commit reference: pending. Phase 7 is not committed yet; the latest commit is `5486ce6` (Build LedgerLine frontend
+and integrate ledger workflows).
+
+### Prompt 1: plan only
+
+> Now prepare Phase 7: production deployment, demo accounts, documentation and final demo. IMPORTANT: PLAN AND INSPECT
+> ONLY…
+
+**What the AI did:** a read-only inspection and a plan.
+
+**Blockers identified:**
+- no Java runtime on Render, so a Dockerfile is needed;
+- `create-database.sql` uses superuser-only logging settings;
+- Render's port must be mapped;
+- no pre-deploy migration hook is expected on Render's free tier;
+- a SPA fallback is needed on Vercel.
+
+### Prompt 2: implementation authorised (no deployment, no cloud resources, no commit)
+
+> LedgerLine — Phase 7 implementation: deployment readiness… Prepare the repository for a Vercel frontend, Render
+> backend and Neon PostgreSQL deployment. Make the smallest safe changes necessary and verify them locally…
+
+**What the AI implemented (no backend application code, migration or ledger logic changed):**
+- **Backend container:**
+  - `backend/Dockerfile`: multi-stage build (`eclipse-temurin:21-jdk` to build, `21-jre-alpine` to run), non-root
+    user, `MaxRAMPercentage=75` with Serial GC, no secrets;
+  - `backend/docker-entrypoint.sh`: maps Render's `PORT` to Spring Boot's `SERVER_PORT` unless `SERVER_PORT` is set;
+  - `backend/.dockerignore`: excludes `.env`, `target/` and `src/test/`.
+- **Vercel:** `frontend/vercel.json` adds the SPA fallback and security headers:
+  - CSP: `default-src 'none'`; `'self'` for scripts, styles, images and fonts; `connect-src 'self'` plus a clearly
+    marked placeholder for the Render origin; no `unsafe-inline` or `unsafe-eval`;
+  - `frame-ancestors 'none'`, `nosniff`, `no-referrer`, Permissions-Policy, COOP, HSTS.
+- **Local preview uses the production headers:** `vite.config.js` makes `vite preview` serve the same headers with the
+  API origin substituted, so the E2E suite runs under the production CSP. `run-e2e.sh` now exports
+  `VITE_API_BASE_URL` for the preview too. A new E2E test checks the headers, the SPA fallback and that there are no
+  CSP violations.
+- **Neon setup scripts:**
+  - `database/setup/create-production-database.sql`: roles without passwords, a temporary owner membership to create
+    the database, fails if anything exists, prints the role attributes;
+  - `database/setup/set-production-role-password.sql`: reads the password from an environment variable, never
+    echoes it.
+- **`scripts/migrate-production.sh`:** an environment file outside the repository with `chmod 600`; refuses local
+  hosts, the local database names and missing `sslmode`; typed confirmation; migration mode from an empty folder;
+  stops on a non-zero exit.
+- **`scripts/seed-demo.py`:** identity verified by signing in before accepting a 409; promotion only from
+  ACCOUNT_HOLDER after matching the database row; accounts opened through the API; deposit with the fixed key
+  `demo-seed-initial-deposit-v1`; a test-only mode limited to a local API and `ledgerline_test_db`.
+- **Sign-in cold-start hint:** shown after 5 s of waiting, or added to a network error; no automatic resubmission.
+- **Docs:** README Deployment, environment matrix, Neon, migrations, Render, Vercel, demo accounts, live checklist,
+  free-tier notes, judge quick-start and project structure; THREATS.md section 9.
+
+### Findings and problems (as they happened)
+
+1. **Platform limitation found by checking Neon's documentation** (neon.com/docs/manage/roles, fetched
+   2026-11-11):
+   - Neon says "Hashed passwords are not supported", so psql's `\password`, which sends a SCRAM hash, cannot set
+     passwords on Neon, contrary to the requested approach;
+   - Neon also says SQL-created roles "are not granted membership in the neon_superuser role", while Console/API
+     roles are; this confirms the roles must be created with SQL for V2 to accept the application role.
+
+   **Resolution, pending developer approval:** passwords are set from an environment variable through
+   `set-production-role-password.sql` (over TLS, never echoed). The residual risk (the plain-text `ALTER ROLE`
+   reaches the provider) is documented in THREATS.md.
+2. **Docker is not installed** on this machine, so the image build was **not** verified. Instead:
+   - the exact build-stage command was run in a clean folder containing only what the Dockerfile copies; it
+     produced the jar;
+   - the entrypoint was run locally with `PORT=8099` in production mode (Flyway disabled, no owner credentials)
+     against `ledgerline_test_db`: health 200 on port 8099, sign-in reached the database (401 for an unknown user),
+     no Flyway activity, and no secret value in the log.
+3. **AI lint issue:** the first version of the cold-start hint reset state inside an effect (`set-state-in-effect`).
+   Fixed by resetting it when a sign-in starts.
+4. **AI script issue:** a backslash in `seed-demo.py`'s docstring produced a Python `SyntaxWarning`; reworded.
+5. **The SQL scripts were not executed** against any database: no Neon project exists yet, and running them locally
+   would create roles. They have been reviewed by reading only.
+
+### Verification (actually run on 2026-11-11)
+
+| Check | Result |
+|---|---|
+| `migrate-production.sh` guards with dummy values (no connection made) | refused localhost, 127.0.0.1, `ledgerline_db`, `sslmode=disable`, a missing `sslmode`, a file with mode 644, a file inside the repository, and a wrong confirmation (exit 1) |
+| `seed-demo.py` in test mode (backend jar in production mode against `ledgerline_test_db`) | run 1: registered three users, promoted ADMIN and AUDITOR, opened both accounts, posted ₹10,000. Run 2: identities verified, nothing new created, the deposit replayed (not posted again). A pre-existing email with a different password: refused (exit 1), its role still ACCOUNT_HOLDER. No password appeared in the output. |
+| `cd backend && ./mvnw clean test` | 290 tests, 0 failures, BUILD SUCCESS |
+| `./mvnw clean verify -Pintegration-tests` | 290 unit and 121 integration tests, 0 failures, BUILD SUCCESS |
+| `cd frontend && npm run lint` | no warnings or errors |
+| `npm test` | 12 files, 65 tests passed (3 new cold-start tests) |
+| `npm run build` | built; `dist/index.html` has no inline script |
+| `./e2e/run-e2e.sh` (test database only, production CSP) | 4 passed, including the new header and CSP test (no violations) |
+| `git diff --check` | no output; nothing staged; no `.env`, log or test output untracked or tracked (only `backend/.env.example`) |
+| Local `ledgerline_db` | still V1–V3; not migrated |
+| Git history | `HEAD` = `origin/main` = `5486ce6`; unchanged |
+
+Nothing was deployed, no cloud resource was created, and nothing was staged, committed or pushed.
+
+### Prompt 3: review correction (2026-11-11)
+
+> I approve the Neon password approach using `set-production-role-password.sql`, with the documented
+> plaintext-statement logging risk. Do not use `psql \password` or create privileged Neon dashboard roles… In
+> `scripts/migrate-production.sh`, explicitly require: DB_USERNAME=ledgerline_app, DB_OWNER_USERNAME=ledgerline_owner.
+> Refuse to continue if either differs. Add or update guard tests for both incorrect values.
+
+**What the AI did:**
+- `migrate-production.sh` now refuses unless `DB_USERNAME` is exactly `ledgerline_app` and `DB_OWNER_USERNAME` is
+  exactly `ledgerline_owner`.
+- The earlier guard checks were ad hoc commands. They are now a committed script,
+  `scripts/test-migrate-production-guards.sh`, which uses dummy values only and never connects to a database.
+- README updated.
+
+**Verification (actually run on 2026-11-11):**
+- `scripts/test-migrate-production-guards.sh`: 12 of 12 refusals confirmed, each before the confirmation prompt:
+  wrong owner user, wrong app user, app user equal to the owner, localhost, loopback, `ledgerline_db`,
+  `ledgerline_test_db`, `sslmode=disable`, missing `sslmode`, file mode 644, file inside the repository, missing
+  file.
+- `bash -n` on both scripts: OK. Python syntax check of `seed-demo.py` with warnings as errors: OK.
+- `git diff --check`: no output.
+- The full test suites were not rerun: no application code changed. Nothing staged, committed or pushed.
+
+### Prompt 4: final narrowly scoped corrections (2026-11-11)
+
+> Make one final, narrowly scoped Phase 7 correction round based on the final security review… Fix M1 — migration
+> environment isolation (mandatory)… launch Java using `env -i`… Fix L1… Fix L2… Fix L3… L5 — TLS verification…
+
+**What the AI did:**
+- **M1:** `migrate-production.sh` starts Java with `env -i`.
+  - The six validated values reach the clean shell through a pipe (`declare -p`), not as `NAME=value` arguments to
+    `env`, which would have put the passwords briefly in the process list.
+  - Only `PATH`, `HOME`, those six values, `SPRING_MAIN_WEB_APPLICATION_TYPE=none` and
+    `SPRING_FLYWAY_ENABLED=true` reach Java.
+  - `SPRING_FLYWAY_ENABLED` must now be unset or exactly `true`.
+- **L1:** one `ALTER ROLE :"role" PASSWORD :'new_password'` statement replaces the `format()`/`\gset` pair, with a
+  warning not to use psql's `-L` option.
+- **L2:** recovery steps in `create-production-database.sql` and the README, limited to a new, empty, dedicated
+  project.
+- **L3:** `seed-demo.py` refuses HTTP redirects. New `scripts/test_seed_demo.py` (5 tests) covers redirects and
+  input checks.
+- **L5:** investigated and documented as an untested prerequisite.
+  - The bundled JDBC driver (42.7.14) has `DefaultJavaSSLFactory`, and the local psql 18.6 supports
+    `sslrootcert=system`.
+  - Neither could be tested: the local server has `ssl=off`, and Neon was not accessed.
+  - The seeder now passes `PGSSLROOTCERT` through if it is set.
+- README and THREATS.md updated.
+
+**Problems met (all in the AI's test code):**
+1. A guard case expected `SPRING_FLYWAY_ENABLED="true "` (trailing space) to be refused, but loading the file as
+   shell assignments drops the unquoted trailing space, so the value really is `true`; the case was replaced with
+   `yes`.
+2. Feeding the confirmation through `script` with a pipe was unreliable (end-of-input arrived before the answer), so
+   the earlier ad-hoc "wrong confirmation" check had probably passed for the wrong reason. The tests now drive the
+   prompt through Python's `pty` module, and a real wrong-confirmation case was added.
+3. A heredoc delimiter clash (`PY` inside text being inserted) made one editing command fail to parse; it changed
+   nothing and was rerun with a different delimiter.
+
+**Verification (actually run on 2026-11-11):**
+
+| Check | Result |
+|---|---|
+| `scripts/test-migrate-production-guards.sh` | 22 of 22 passed: 12 earlier refusals; 8 `SPRING_FLYWAY_ENABLED` values (`false`, `FALSE`, `False`, `0`, `no`, `yes`, `TRUE`, `True`); a wrong confirmation typed at a real prompt; environment isolation |
+| Isolation case | With hostile `SPRING_DATASOURCE_URL`, `SPRING_FLYWAY_URL`, `SPRING_FLYWAY_USER`, `SPRING_FLYWAY_PASSWORD`, `SPRING_APPLICATION_JSON`, `SPRING_CONFIG_LOCATION`, `SPRING_CONFIG_IMPORT`, `SPRING_PROFILES_ACTIVE` inherited, and `SPRING_*` and `JAVA_TOOL_OPTIONS` in the file: Java received only the allowed variables, `DB_URL` was the validated one, and no secret was in its arguments |
+| Mutation check | With `env -i` replaced by `env`, the isolation case failed, listing the leaked variables (temporary copy, deleted) |
+| psql quoting (read-only `SELECT` on `ledgerline_test_db` as `ledgerline_app`) | `:'new_password'` passed a value with quotes, `$` and `DROP ROLE x; --` exactly as data; `:"role"` produced the identifier |
+| `python3 scripts/test_seed_demo.py` | 5 tests OK. The redirect was refused and the target server received no request. Mutation: with redirects allowed, the test failed |
+| `seed-demo.py` end to end (test mode, local backend on `ledgerline_test_db`) | run 1 created, promoted and deposited; run 2 created nothing new and replayed the deposit; no secret in the output |
+| `bash -n` on the shell scripts; Python syntax with warnings as errors | OK |
+
+The SQL setup scripts were still not run against any database. No application code changed, so the full backend and
+frontend suites were not rerun. Nothing staged, committed or pushed.

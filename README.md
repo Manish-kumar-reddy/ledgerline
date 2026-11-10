@@ -9,10 +9,12 @@ Secure money movement and double-entry ledger system built with Spring Boot, Pos
 
 ```text
 ledgerline/
-├── backend/            Spring Boot API (Java 21, Maven Wrapper)
-├── database/setup/     Owner-only SQL: create roles and databases; set a user's role
-├── frontend/           React app (Vite)
+├── backend/            Spring Boot API (Java 21, Maven Wrapper); Dockerfile for deployment
+├── database/setup/     Owner-only SQL: local and production roles and databases; set a user's role
+├── frontend/           React app (Vite); vercel.json for deployment
+├── scripts/            Production migration runner and demo-account seeding (secrets from the environment only)
 ├── PROMPTS.md          Log of AI assistance used in this project
+├── THREATS.md          Threat model
 └── README.md
 ```
 
@@ -229,6 +231,185 @@ How this was verified locally (the jar run from an empty folder, so `backend/.en
 - The migration step with an unsafe `DB_USERNAME` exited 1 with "Refusing to run migrations", before Flyway
   connected.
 - No secret appeared in any output.
+
+## Deployment: Vercel (frontend), Render (backend), Neon (PostgreSQL)
+
+> **Status:** prepared, not yet deployed. Live URLs below are placeholders until a real deployment is verified.
+>
+> - Frontend: `https://<your-project>.vercel.app` *(to be filled in after deployment)*
+> - Backend: `https://<your-service>.onrender.com` *(to be filled in after deployment)*
+
+Never use a local database for production, and never put a secret in the repository, a `VITE_` variable, a
+command-line argument or a log.
+
+### Environment variables: which service gets what
+
+| Variable | Render (app) | Migration step (your machine) | Seeding (your machine) | Vercel build | Secret |
+|---|---|---|---|---|---|
+| `DB_URL` (`jdbc:postgresql://<neon-direct-host>/ledgerline?sslmode=require`) | yes | yes | yes | – | keep private |
+| `DB_USERNAME` (`ledgerline_app`) | yes | yes (as `${app_role}`) | – | – | no |
+| `DB_PASSWORD` | yes | yes | – | – | **yes** |
+| `DB_OWNER_USERNAME` (`ledgerline_owner`) | **never** | yes | yes (role promotion) | – | no |
+| `DB_OWNER_PASSWORD` | **never** | yes | yes (role promotion) | – | **yes** |
+| `JWT_SECRET` (new: `openssl rand -base64 48`) | yes | yes (start-up check) | – | – | **yes** |
+| `SPRING_FLYWAY_ENABLED=false` | yes | must not be `false` | – | – | no |
+| `CORS_ALLOWED_ORIGINS` (exact Vercel URL) | yes | – | – | – | no |
+| `SERVER_FORWARD_HEADERS_STRATEGY=native` | yes | – | – | – | no |
+| `SPRING_DATASOURCE_HIKARI_MAXIMUM_POOL_SIZE` (e.g. `5`) | yes | – | – | – | no |
+| `PORT` | injected by Render; the image maps it to `SERVER_PORT` | – | – | – | no |
+| `LEDGERLINE_API_BASE_URL`, `DEMO_*_EMAIL`, `DEMO_*_PASSWORD` | – | – | yes | – | **passwords yes** |
+| `VITE_API_BASE_URL` (the Render URL) | – | – | – | yes | **no: bundled into public JavaScript** |
+
+Files holding secrets on your machine live **outside the repository** with `chmod 600` (for example
+`~/.ledgerline/production-migrate.env` and `~/.ledgerline/seed-demo.env`).
+
+### 1. Neon: dedicated production database
+
+1. Create a **new, dedicated** Neon project (PostgreSQL 16 or later). Use its **direct** (not `-pooler`) host.
+2. Create the roles and database **with SQL** (roles made in the Neon Console or API become members of
+   `neon_superuser`, which migration V2 refuses for the application role):
+
+   ```bash
+   psql "host=<neon-direct-host> dbname=neondb user=neondb_owner sslmode=require" -X \
+        -f database/setup/create-production-database.sql
+   ```
+
+   It creates `ledgerline_owner` (owns database `ledgerline`; Flyway only) and `ledgerline_app` (runtime; may only
+   connect), with no superuser, CREATEDB, CREATEROLE or BYPASSRLS. It fails without changing anything if they
+   already exist, and prints the resulting attributes for you to check.
+3. Set each password. Neon **does not accept pre-hashed passwords**, so psql's `\password` cannot be used; this
+   script reads the password from an environment variable (never a command-line argument or a file), sends it in a
+   single `ALTER ROLE` statement over TLS, and echoes nothing. Do not add psql's `-L` log option. Neon could still
+   record that statement if its server-side statement logging is enabled (see THREATS.md):
+
+   ```bash
+   openssl rand -base64 48 | tr -d '/+=\n' | cut -c1-40    # generate; store in your password manager
+   read -rs LEDGERLINE_NEW_PASSWORD && export LEDGERLINE_NEW_PASSWORD
+   psql "host=<neon-direct-host> dbname=neondb user=neondb_owner sslmode=require" -X \
+        -v role=ledgerline_owner -f database/setup/set-production-role-password.sql
+   unset LEDGERLINE_NEW_PASSWORD                            # repeat for -v role=ledgerline_app
+   ```
+4. Check: connecting as `ledgerline_app` to `ledgerline` with `sslmode=require` works, and `create table x (i int)`
+   is refused.
+5. **If step 2 stopped part-way** (for example the roles were created but `CREATE DATABASE` failed): follow the
+   recovery steps at the top of `create-production-database.sql`. They apply **only** to the new, empty project
+   dedicated to LedgerLine (drop the two new roles if the database does not exist; otherwise finish the remaining
+   grants by hand). Never drop roles or databases in a project that holds anything else; if in doubt, delete the
+   dedicated project and start a new one.
+
+**TLS certificate verification (deployment prerequisite, not yet verified).** `sslmode=require` encrypts the
+connection but does not prove the server's identity. Full verification is expected to work with these settings,
+but has **not** been tested (the local PostgreSQL has TLS off, and Neon has not been accessed):
+- Java (Render, migration step): `DB_URL=jdbc:postgresql://<host>/ledgerline?sslmode=verify-full&sslfactory=org.postgresql.ssl.DefaultJavaSSLFactory`
+  (driver 42.7.14 ships this factory; it uses the JVM's default trusted certificate authorities).
+- psql (setup scripts, `seed-demo.py`): `sslmode=verify-full` with `PGSSLROOTCERT=system` (libpq 16 or later; the
+  local psql is 18.6). Put `PGSSLROOTCERT=system` in `seed-demo.env` for the seeder.
+Test both against Neon before relying on them; if either fails, `sslmode=require` remains in use and this stays a
+documented limitation. The scripts accept `require`, `verify-ca` and `verify-full`.
+
+### 2. Migrations (from your machine, before every backend deploy)
+
+```bash
+chmod 600 ~/.ledgerline/production-migrate.env     # DB_URL, DB_USERNAME, DB_PASSWORD, DB_OWNER_*, JWT_SECRET
+scripts/migrate-production.sh ~/.ledgerline/production-migrate.env
+```
+
+The script refuses local hosts and the local database names, requires `sslmode=require` (or stricter), requires
+`DB_USERNAME=ledgerline_app` and `DB_OWNER_USERNAME=ledgerline_owner` exactly, accepts `SPRING_FLYWAY_ENABLED` only
+if unset or exactly `true`, requires the file to be outside the repository and `chmod 600`, asks you to type
+`migrate <database>`, builds the jar, and runs it in migration mode from an empty folder with an **empty
+environment** (`env -i`): Java receives only `PATH`, `HOME`, the six validated variables (passed through a pipe,
+never as arguments), `SPRING_MAIN_WEB_APPLICATION_TYPE=none` and `SPRING_FLYWAY_ENABLED=true`. Inherited or
+file-supplied `SPRING_DATASOURCE_URL`, `SPRING_FLYWAY_URL`, `SPRING_FLYWAY_USER`, `SPRING_APPLICATION_JSON`,
+`SPRING_CONFIG_*` or `JAVA_TOOL_OPTIONS` therefore cannot redirect it. Exit 0 means V1–V6 were
+applied and validated; anything else stops: do not deploy. Running it again prints "Schema "public" is up to date".
+Its refusals and the environment isolation are covered by `scripts/test-migrate-production-guards.sh` (dummy values
+only; never connects to a database; the isolation case uses a fake `java` that records what it receives).
+
+### 3. Render: backend
+
+- New **Web Service** from the private GitHub repository, **Runtime: Docker**, **Root Directory: `backend`**
+  (uses `backend/Dockerfile`: Java 21 JRE, non-root user, no secrets in the image).
+- Environment: the "Render (app)" column above. Never the owner variables.
+- Health check path: `/api/health`.
+- Check before connecting the frontend:
+  `curl https://<render-host>/api/health` → `{"status":"UP",…}`; register and sign in a throwaway user with `curl`.
+
+`/api/health` only shows that the web server is running; it does **not** check the database. A working sign-in is
+the real readiness check.
+
+### 4. Vercel: frontend
+
+- New project from the repository, **Root Directory: `frontend`**, build `npm run build`, output `dist`.
+- Environment: `VITE_API_BASE_URL=https://<render-host>` (public).
+- **Before deploying, edit `frontend/vercel.json`:** replace `https://REPLACE-WITH-RENDER-BACKEND-HOST` in
+  `connect-src` with the real Render origin. Until then the browser blocks every API call (it fails closed).
+- `vercel.json` also provides the SPA fallback (deep links like `/accounts/<id>`) and security headers: a
+  Content-Security-Policy with no `unsafe-inline` or `unsafe-eval` (the Vite build has no inline scripts or
+  styles), `frame-ancestors 'none'`, `nosniff`, `no-referrer`, a restrictive Permissions-Policy and HSTS. The E2E
+  tests run against these same headers (`vite preview` serves them).
+- Then set Render's `CORS_ALLOWED_ORIGINS` to the exact Vercel production URL and redeploy the backend.
+
+### 5. Demo accounts
+
+```bash
+chmod 600 ~/.ledgerline/seed-demo.env
+python3 scripts/seed-demo.py ~/.ledgerline/seed-demo.env
+```
+
+`seed-demo.env` (outside the repository) holds `LEDGERLINE_API_BASE_URL`, `DB_URL`, `DB_OWNER_USERNAME`,
+`DB_OWNER_PASSWORD` and `DEMO_HOLDER_EMAIL/PASSWORD`, `DEMO_ADMIN_EMAIL/PASSWORD`, `DEMO_AUDITOR_EMAIL/PASSWORD`
+(three different passwords, 12–72 bytes; optional `DEMO_INITIAL_DEPOSIT`, default `10000.00`). The script:
+
+- registers the three users through the public API; an existing email is accepted only if signing in with the
+  supplied password works and `/api/auth/me` confirms it (an account registered by someone else is never touched);
+- promotes the admin and auditor with `set-user-role.sql` as `ledgerline_owner` over TLS, only from
+  `ACCOUNT_HOLDER` and only after matching the database row to the signed-in user;
+- opens "Demo Everyday" and "Demo Savings" for the holder and deposits the initial amount with the fixed
+  `Idempotency-Key` `demo-seed-initial-deposit-v1`, so reruns replay it instead of posting again. If that account
+  was recreated or the amount changed, the backend answers 409 and the script stops (nothing posted twice).
+
+It never prints passwords or tokens, and it refuses HTTP redirects (so a sign-in token is never forwarded to
+another host). `python3 scripts/test_seed_demo.py` tests the redirect refusal and the input checks without a
+backend or database. Verified locally against `ledgerline_test_db` in its test-only mode
+(`LEDGERLINE_SEED_ALLOW_TEST_TARGET=1`): first run created and promoted everything; second run changed nothing and
+replayed the deposit; a pre-existing email with a different password was refused and its role left unchanged.
+**Demo credentials are not in this repository**; they are provided privately with the submission.
+
+### 6. Live verification checklist (record the real results)
+
+- [ ] Health 200; time the first request after an idle period (cold start).
+- [ ] Register (201); duplicate email (409); invalid fields shown.
+- [ ] Sign in; wrong password gives the generic message; reload signs out.
+- [ ] Open account; deposit ₹500; withdraw ₹200; withdraw ₹1,000 → **refused**, balance unchanged, shown on the
+      statement; transfer ₹100 to another account; both statements' running balances add up.
+- [ ] Retry after a network failure (DevTools offline) posts once.
+- [ ] Holder → oversight pages show "Not permitted" and the API returns 403; auditor/admin have no money actions
+      (API 403); another user's account ID gives 404.
+- [ ] Reconciliation: "Books balanced", total ₹0.00.
+- [ ] Failed sign-ins from two different networks are counted separately (forwarded client IP works; see
+      THREATS.md).
+- [ ] No secrets in the browser bundle, Render logs or Git.
+
+### Free-tier notes (platform-dependent: check the providers' current terms)
+
+- Render's free web services are expected to **sleep when idle**; the first request then waits while the Java
+  application starts (possibly a minute or more). The sign-in page says so if signing in is slow. Warm the service
+  (open `/api/health`) before a demo. Small instances also make BCrypt sign-ins slower (cost unchanged).
+- The in-memory rate limits reset whenever the instance restarts or sleeps.
+- Neon suspends idle compute; the first query after a pause is slower. Check connection limits for your compute
+  size (the app uses a small pool; `ledgerline_app` is limited to 20 connections).
+- Render's free tier is not expected to offer a pre-deploy command, so migrations run from your machine (step 2).
+
+### Judge quick-start
+
+1. Open the frontend URL (wait up to a minute the first time if the backend was asleep).
+2. Sign in with the **demo holder** credentials provided with the submission (or register a new account).
+3. Open "Demo Everyday": deposit, withdraw, try a withdrawal larger than the balance (refused and recorded), and
+   transfer to "Demo Savings" by pasting its account ID. Check the statement's running balances.
+4. Sign out, sign in as the **auditor** or **admin**: browse all accounts and statements (read-only) and open
+   Reconciliation.
+5. Note: five wrong passwords for one email lock it for 15 minutes (rate limit); please copy credentials carefully.
 
 ## Running
 
@@ -639,8 +820,8 @@ limiter is full. Memory: roughly 20 MB per 100,000 keys per limiter (a rough loc
 - **Registration reveals whether an email is registered** (409). Login does not.
 - **Frontend session:** the token is held in memory only, so reloading the page or opening a new tab requires
   signing in again. There is no refresh token and no server-side logout.
-- **Frontend features follow the API:** no user directory, no admin actions, no account lookup by name, and no
-  seeded demo accounts yet (planned for the deployment phase, with credentials from environment variables).
+- **Frontend features follow the API:** no user directory, no admin actions and no account lookup by name. Demo
+  accounts are created by `scripts/seed-demo.py` at deployment time; their credentials are never in the repository.
 - **Local PostgreSQL uses `trust` authentication** (see above), so database passwords are not verified locally.
 - **Accounts (Phase 4):**
   - Ownership of a new account is enforced by the application, not by PostgreSQL. The app role may insert any

@@ -121,3 +121,53 @@ unchanged), `LedgerConcurrencyIT` (40 refusals each show the unchanged balance).
 - **Unbounded simulated money:** deposits are capped per operation and per account balance, not in total.
 - **Not covered:** backups and point-in-time recovery, monitoring and alerting, multi-instance rate limiting
   (in-memory limiters, see README), and secret rotation procedures.
+
+## 9. Deployment (Vercel, Render, Neon)
+
+Prepared and checked locally; **not yet deployed**. Items marked "verify" must be confirmed on the live system.
+
+- **Platform secrets.** `DB_PASSWORD` and `JWT_SECRET` live only in Render's environment settings; the migration
+  owner's credentials never reach Render (the app runs with `SPRING_FLYWAY_ENABLED=false`, verified locally: no
+  Flyway activity and no owner variables needed). The Docker image contains no secrets (`.dockerignore` excludes
+  `.env`). Files on the developer's machine are outside the repository and `chmod 600`; the scripts refuse other
+  permissions and never print secret values or pass them as command-line arguments. `VITE_API_BASE_URL` is public
+  by design: nothing secret may use the `VITE_` prefix.
+- **Production database isolation and migration credentials.** A dedicated Neon project; roles created by SQL
+  (Neon makes Console/API roles members of `neon_superuser`, which V2 refuses). The migration runner refuses local
+  hosts, the local database names and connections without `sslmode=require`, and requires typed confirmation.
+  **Residual risk:** Neon accepts only plain-text passwords, so `set-production-role-password.sql` sends the
+  password in one `ALTER ROLE … PASSWORD` statement (read from an environment variable, quoted by psql, over TLS,
+  never echoed, never in a process argument). PostgreSQL records statement text when `log_statement` is `ddl` or
+  `all`, and records a failing statement under `log_min_error_statement`, so the password could appear in Neon's
+  server logs; Neon controls those settings. A client-side psql `-L` log file would also capture it (the
+  documented command does not use `-L`). Rotate the password if exposure is suspected.
+- **Migration environment isolation.** `migrate-production.sh` starts Java with `env -i`, so only `PATH`, `HOME`, the
+  six validated variables and the two fixed Spring settings reach it; hostile inherited or file-supplied
+  `SPRING_DATASOURCE_URL`, `SPRING_FLYWAY_URL`, `SPRING_APPLICATION_JSON`, `SPRING_CONFIG_*` or
+  `JAVA_TOOL_OPTIONS` cannot point the migration at another database (tested with a fake `java`).
+  `SPRING_FLYWAY_ENABLED` must be unset or exactly `true`.
+- **TLS server authentication.** `sslmode=require` encrypts but does not verify the server certificate, so an
+  attacker able to intercept the network path could impersonate the database. `verify-full` settings for the
+  JDBC driver and psql are documented but **not yet tested** (deployment prerequisite; see README).
+- **CORS origin.** `CORS_ALLOWED_ORIGINS` must be exactly the Vercel production URL (verify after deployment).
+  Preview deployments are deliberately not allowed. CORS is not an authentication control: every request still
+  needs a valid token.
+- **CSP and browser exposure.** `vercel.json` sets a Content-Security-Policy without `unsafe-inline` or
+  `unsafe-eval` and with `connect-src` limited to the app and the API origin, plus `frame-ancestors 'none'`,
+  `nosniff`, `no-referrer` and HSTS. The E2E suite runs under the same policy (via `vite preview`) and fails on any
+  CSP violation. The access token stays in memory only. A placeholder API origin left in `vercel.json` blocks all
+  API calls (fails closed).
+- **Reverse proxy and client IP.** With `SERVER_FORWARD_HEADERS_STRATEGY=native`, Tomcat trusts `X-Forwarded-For`
+  only from private-network addresses. If Render's proxy reaches the app from another range, every client shares
+  one per-IP limit (availability risk, not a bypass: the app is reachable only through Render's proxy, so the header
+  cannot be forged directly). **Verify** after deployment with failed sign-ins from two networks.
+- **Cold starts and availability.** Free instances are expected to sleep; the first request can take a minute or
+  more, and in-memory rate limits reset on restart. `/api/health` does not check the database. Warm the service
+  before demos; the sign-in page explains slow starts.
+- **Demo-account lockout.** Five wrong passwords for a demo email lock it for 15 minutes (per instance, in memory).
+  Anyone who knows a demo email can do this deliberately; the demo works around it by restarting the service or
+  using another demo user. Demo credentials are shared privately, never committed.
+- **Demo seeding.** `scripts/seed-demo.py` refuses HTTP redirects, so its bearer token cannot be forwarded to
+  another host (tested). It never promotes an account it cannot sign in to with the supplied
+  password, only promotes from `ACCOUNT_HOLDER`, matches the database row to the signed-in user, and uses a fixed
+  idempotency key for the initial deposit so reruns cannot post it twice (verified locally on the test database).
