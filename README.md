@@ -246,10 +246,45 @@ Frontend:
 ```bash
 cd frontend
 npm install
-npm run dev
+npm run dev                   # VITE_API_BASE_URL defaults to http://localhost:8080
 ```
 
-Then open <http://localhost:5173>.
+Then open <http://localhost:5173> (the backend's default CORS origin). Note: starting the backend with the default
+configuration runs Flyway against `ledgerline_db`, bringing it to the latest migration.
+
+## Frontend (Phase 6)
+
+React 19, Vite, React Router and Axios, with plain CSS (no UI library). The backend is the only security
+authority: the frontend's role checks only decide what to show, and every request is authorized again by the API.
+
+| Screen | Path | Who | Uses |
+|---|---|---|---|
+| Sign in, Create account | `/login`, `/register` | anyone | `POST /api/auth/login`, `POST /api/auth/register`, `GET /api/auth/me` |
+| My accounts | `/accounts` | ACCOUNT_HOLDER | `GET/POST /api/accounts` |
+| Account: balance, deposit, withdraw, transfer, statement | `/accounts/:id` | ACCOUNT_HOLDER | `GET /api/accounts/{id}`, `POST …/deposits`, `…/withdrawals`, `…/transfers`, `GET …/statement` |
+| All accounts (read-only) | `/oversight/accounts` | ADMIN, AUDITOR | `GET /api/oversight/accounts` |
+| Any account's statement (read-only) | `/oversight/accounts/:id` | ADMIN, AUDITOR | `GET /api/oversight/accounts/{id}/statement` |
+| Reconciliation | `/oversight/reconciliation` | ADMIN, AUDITOR | `GET /api/oversight/reconciliation` |
+
+How it behaves:
+- **Session:** the access token is kept **in memory only** (never `localStorage`, cookies or the URL). Reloading the
+  page signs you out. There is no logout endpoint: signing out discards the token. The session ends automatically
+  when the 15-minute token expires, and any 401 from a protected request returns to the sign-in page ("Your session
+  has ended"). A 403 is shown as "Not permitted".
+- **Money:** amounts are typed as text, checked against the same rule as the backend, and sent as the exact string
+  (`"1500.50"`). Display uses integer paise with Indian digit grouping (`₹1,00,00,000.00`); no floating point.
+- **Idempotency:** each money request carries an `Idempotency-Key`. A retry after a network error, a 5xx or a 503
+  ("Ledger busy") resends the **same** key, so it can never post twice; changing the form or starting a new
+  operation uses a new key. Withdrawals and transfers ask for confirmation first.
+- **Outcomes:** posted (green, new balance), refused (red, reason, unchanged balance, recorded on the statement),
+  409 (key reused with different details: nothing posted), 503 (busy: retry offered).
+- **Statements:** debit and credit columns, running balance, refused attempts with their reason, the initiator
+  ("You" or a shortened user id) and the other account. Print-friendly.
+- **Oversight:** ADMIN and AUDITOR see the same read-only views (the backend gives them the same access). The
+  settlement account is labelled "Settlement (system)". Reconciliation shows "Books balanced" or each difference.
+- **Transfers** need the recipient's full account ID (there is no lookup by name or email); each account shows its ID
+  with a Copy button.
+- Responsive down to small phones (tables become labelled rows), visible keyboard focus, `prefers-reduced-motion`.
 
 ## Authentication API
 
@@ -602,7 +637,10 @@ limiter is full. Memory: roughly 20 MB per 100,000 keys per limiter (a rough loc
 - **No refresh tokens or logout.** A token stays valid until it expires (15 minutes), unless the user is
   disabled. The client signs in again after expiry.
 - **Registration reveals whether an email is registered** (409). Login does not.
-- **Token storage in the browser** is decided in Phase 9; the plan is memory only, not `localStorage`.
+- **Frontend session:** the token is held in memory only, so reloading the page or opening a new tab requires
+  signing in again. There is no refresh token and no server-side logout.
+- **Frontend features follow the API:** no user directory, no admin actions, no account lookup by name, and no
+  seeded demo accounts yet (planned for the deployment phase, with credentials from environment variables).
 - **Local PostgreSQL uses `trust` authentication** (see above), so database passwords are not verified locally.
 - **Accounts (Phase 4):**
   - Ownership of a new account is enforced by the application, not by PostgreSQL. The app role may insert any
@@ -640,7 +678,8 @@ cd backend
 ./mvnw verify -Pintegration-tests    # unit + integration tests; needs PostgreSQL, ledgerline_test_db and JWT_SECRET
 
 cd ../frontend
-npm run lint && npm run build
+npm run lint && npm test && npm run build
+./e2e/run-e2e.sh                     # end-to-end, see below
 ```
 
 - Integration tests are the classes ending in `IT`, run by Maven Failsafe. They use the `test` Spring profile,
@@ -682,6 +721,22 @@ npm run lint && npm run build
   the in-flight case is tested deterministically. Window expiry uses a controllable clock (`MutableClock`).
 - Mockito is loaded as a JVM agent (`-javaagent`, configured in `pom.xml`), which removes the JDK's warning about
   Mockito attaching itself at runtime.
+
+### Frontend tests
+
+- `npm test` (Vitest, React Testing Library, jsdom): money parsing and INR formatting; the API client (Bearer header,
+  401 ends the session except on login, 403 is reported); error mapping (`Retry-After`, field errors, retryable
+  statuses); idempotency keys (same key on retry, new key when the request changes or after a definite outcome);
+  the money form (validation, confirmation, posted, refused, 409, 503 retry with the same key, network retry);
+  statement rendering (debit/credit, refused lines, running balance, initiator); role-based navigation and
+  "Not permitted"; login (401, 429, expired session); registration (UTF-8 byte rule, 409); reconciliation views;
+  the token stays out of browser storage.
+- `./e2e/run-e2e.sh` (Playwright, Chromium): builds the backend jar and starts it on port 8081 against
+  **`ledgerline_test_db`** (it refuses to run otherwise; `ledgerline_db` is never used), builds the frontend for that
+  backend, and drives a real browser: two holders register, deposit, withdraw, get a refusal, transfer, and check both
+  statements; an auditor (promoted with `set-user-role.sql` on the test database) sees read-only oversight and
+  balanced books; reloading signs out. Credentials are read from `backend/.env` into the environment only. Nothing
+  is reset: each run creates new users. Requires `psql` and `npx playwright install chromium` once.
 
 ### Test database guard
 

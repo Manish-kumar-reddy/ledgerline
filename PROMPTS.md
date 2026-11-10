@@ -1211,3 +1211,79 @@ rejected with LL400.
 | `git diff --check` | no output; untracked files have no trailing whitespace |
 
 Nothing was staged, committed or pushed.
+
+---
+
+## Session 15: 2026-11-10 to 2026-11-11, Phase 6 (frontend)
+
+Commit reference: pending. Phase 6 is not committed yet; the latest commit is `a8c5791` (Implement double-entry
+ledger and financial operations).
+
+### Prompt 1: plan only
+
+> Now prepare Phase 6: build the complete LedgerLine frontend and integrate it with the existing backend. Do not modify
+> files yet… First, verify the actual API contracts and permissions from the source code. Do not invent endpoints…
+
+**What the AI did:**
+- Inspected the frontend: a bare React 19 and Vite skeleton in JavaScript.
+- Checked every controller, DTO, URL rule and the CORS configuration.
+- Proposed a plan.
+
+**Backend facts the plan had to respect:**
+- ADMIN and AUDITOR have identical read-only oversight; there are no admin actions.
+- There is no logout endpoint and no refresh token.
+- There is no account lookup, so transfers need the recipient's account ID.
+- A statement's initiator is a user ID only.
+
+**No backend blockers were found.**
+
+### Prompt 2: approval
+
+> Phase 6 plan approved… Token storage: memory only… End-to-end tests: use `ledgerline_test_db`, NOT `ledgerline_db`…
+> Seed accounts: defer to the deployment phase… Keep the backend unchanged unless a genuine integration blocker is
+> discovered… Do not stage, commit or push until I review…
+
+**What the AI implemented (no backend file changed):**
+- Dependencies: `react-router`, `axios`; dev: `vitest`, Testing Library, `jsdom`, `@playwright/test`.
+- `src/api`: an Axios client that keeps the token in memory, treats a 401 on protected requests as end of session
+  (except on login), and maps errors; idempotency keys; one module per backend area.
+- `src/auth`: session context with automatic expiry and route guards (UI only).
+- `src/money`: exact string-to-paise conversion and INR formatting with Indian grouping, with no floating point.
+- Components: shell, money form (with confirmation and retries that reuse the same key), result panel, statement
+  table, and shared UI states.
+- Pages: sign in, register, my accounts, account (move money and statement), all accounts, any statement,
+  reconciliation, not permitted, not found.
+- Banking-style CSS: responsive, stacked tables on small screens, print stylesheet.
+- 62 Vitest tests; Playwright E2E with a runner that refuses any database other than `ledgerline_test_db`.
+- README Frontend section and test documentation.
+
+### Mistakes and interruptions (as they happened)
+
+1. **One tool call was rejected by the developer mid-run** (the first attempt to write `StatementTable`,
+   `MoneyForm` and `PostingResult`). Nothing was written. After the developer said "continue", the AI rewrote those
+   three files.
+2. **AI lint issues:** oxlint reported 6 `only-export-components` warnings, because helper functions and constants
+   were exported from component files. They were moved into plain modules (`auth/session.js`,
+   `components/navigation.js`, `components/labels.js`, `pages/registration.js`); lint is now clean.
+3. **AI test mistakes (2 Vitest, 1 E2E), fixed in the tests; no application behaviour was changed to make them pass:**
+   - a routing test expected one "Reconciliation" link, but the oversight page legitimately has two (navigation and
+     a page button), so the test now looks inside the navigation bar;
+   - a registration test contradicted its own comment (three emoji are 12 UTF-8 bytes, which is allowed);
+   - the auditor E2E test expected the settlement account on page 1 of the oversight list, but the test database
+     holds many older accounts (oldest first). The test now opens the first listed statement and checks it is
+     read-only.
+
+### Verification (actually run on 2026-11-11)
+
+| Command | Result |
+|---|---|
+| `cd frontend && npm run lint` | no warnings or errors |
+| `npm test` (`vitest run`) | 12 files, 62 tests, all passed |
+| `npm run build` | built successfully |
+| `cd backend && ./mvnw clean test` (database URLs pointed at an unused port) | 290 unit tests, 0 failures |
+| `./mvnw clean verify -Pintegration-tests` | 290 unit and 121 integration tests, 0 failures (backend unchanged) |
+| `cd frontend && ./e2e/run-e2e.sh` (backend jar on port 8081 against `ledgerline_test_db`, Chromium) | 3 passed: the two-holder journey (deposit ₹500, withdraw ₹200, refused ₹1,000 "Insufficient funds", transfer ₹100, both statements checked); auditor read-only oversight with "Books balanced"; reload signs out with nothing in browser storage |
+| `ledgerline_db` Flyway version after E2E | still V3 (untouched) |
+| `git diff --check` | no output |
+
+Nothing was staged, committed or pushed.
