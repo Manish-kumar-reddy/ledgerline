@@ -1457,3 +1457,72 @@ Nothing was deployed, no cloud resource was created, and nothing was staged, com
 
 The SQL setup scripts were still not run against any database. No application code changed, so the full backend and
 frontend suites were not rerun. Nothing staged, committed or pushed.
+
+---
+
+## Session 17: 2026-11-11, sign-in page visual redesign
+
+Commit reference: pending. The latest commit is `80b0957` (Prepare LedgerLine for production deployment).
+
+### Prompt
+
+> LedgerLine — Sign In Page Visual Redesign. Redesign the existing LedgerLine sign-in page with a completely original,
+> premium fintech visual identity… Modify ONLY the sign-in page and the styles/assets required by that page… Do NOT
+> copy BalanceVault… "Every rupee. Every entry. Accounted for."… Preserve all existing functionality… Do not weaken
+> Content Security Policy… Do not add fake live financial data or misleading security claims.
+
+### What the AI did
+
+- **Sign-in page only.** `Login.jsx` stopped using the shared `AuthLayout`, which registration still uses
+  unchanged, and got its own layout.
+  - The form logic, labels, button names, messages, banners, cold-start hint, loading state and error handling are
+    unchanged.
+  - Only markup and classes changed, plus a small spinner inside the button while signing in.
+- **New `SignInShowcase.jsx`:**
+  - an original brand mark (two equal bars in a ledger frame: debit = credit);
+  - the headline "Every rupee. Every entry. Accounted for.";
+  - a ledger illustration of three postings, each with equal debit and credit, and a "Debits = Credits ·
+    Balanced" footer. It is the README's worked example, labelled "Journal · example" with the caption "Illustration
+    … Sample figures", so it is not live data;
+  - three factual notes (balanced by design, refusals shown, simulated INR).
+- **New `styles/signin.css`, all selectors scoped under `.signin`:**
+  - midnight background, teal accent, subtle grid and glow, refined dark inputs with a teal focus ring, a gradient
+    primary button, dark variants of the shared message panels;
+  - staggered row entrance and a pulse on "Balanced", switched off under `prefers-reduced-motion`;
+  - no inline styles, external fonts or images, so the CSP is unchanged (`style-src 'self'`).
+- **Responsive:** two columns on desktop and laptop. Below 900 px the form comes first under a compact brand header,
+  with the showcase after it; the ledger condenses at 560 px and 380 px.
+
+### Problems found and fixed by the AI during its own review
+
+1. **Heading order:** the tagline was first written as an `h2` placed before the page's `h1` ("Sign in"); changed to a
+   styled paragraph.
+2. **Layout:** screenshots at 820 px and 390 px showed the form below a full screen of brand content (you had to
+   scroll to sign in). Fixed by placing the form first on small screens; the E2E test now checks that the form is
+   visible without scrolling.
+3. A compact-brand element that was hidden at every width was removed as dead markup, then reintroduced as the
+   small-screen header used by fix 2.
+
+### Verification (actually run on 2026-11-11)
+
+| Check | Result |
+|---|---|
+| `npm run lint` | no warnings or errors |
+| `npm test` | 12 files, 67 tests passed (65 before plus 2 new: link and illustration labelling, button disabled until both fields are filled); the existing Login tests passed unchanged |
+| `npm run build` | built |
+| Screenshots of the production build (`vite preview`) at 1440×900, 1280×800, 820×1180, 390×844, 360×740 | horizontal overflow 0 px at every size; 0 CSP violations |
+| Screenshots of states (API simulated with Playwright request interception) | registration banner, filled and focused fields with the enabled button, the "Invalid email or password." error with the password cleared, and the loading state ("Signing in…", spinner, button disabled) |
+| E2E (real backend on `ledgerline_test_db`, production CSP). AI's run, from `frontend/`: `./e2e/run-e2e.sh`. Developer's shell, from the repository root: `PGSSLMODE=disable PGCHANNELBINDING=disable ./frontend/e2e/run-e2e.sh` | 5 passed, including the new sign-in test: a wrong password shows the existing error, the registration link opens "Create your account", and there is no horizontal overflow at 360, 820 and 1440 px with the form in view |
+| Scope | `Register.jsx`, `AuthLayout.jsx`, `app.css`, `tokens.css`, the components, `api`, `auth`, `App.jsx`, backend and database unchanged |
+
+**Note on the E2E command:** the AI's shell had no `PG*` variables, so the plain runner passed there. The developer's
+shell inherits Neon settings (`PGSSLMODE` and `PGCHANNELBINDING`). The runner's `psql` call (used to promote the E2E
+auditor) would then require TLS and channel binding against the local PostgreSQL test database, which has TLS off.
+So in that shell the two overrides are required; the developer reports that all 5 tests passed with them.
+
+**Observation, not caused by this session:** `ledgerline_db`'s Flyway history shows V4–V6 applied by
+`ledgerline_owner` at 2026-11-11 01:18:57, three minutes after commit `80b0957` and before this session began. No
+command in this session touched `ledgerline_db`: the E2E runner only uses `ledgerline_test_db`, and the screenshots
+used no backend. The AI reported this and changed nothing.
+
+Nothing was staged, committed or pushed.

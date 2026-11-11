@@ -153,3 +153,25 @@ test('the production security headers are served and the app runs under its Cont
   await expect(page.getByRole('heading', { name: 'My accounts' })).toBeVisible();   // API calls allowed by connect-src
   expect(violations).toEqual([]);
 });
+
+test('sign-in page: wrong password shows the error, the registration link works, no horizontal overflow', async ({ page }) => {
+  const email = uniqueEmail('e2e-signin');
+  await register(page, 'Sign-in E2E', email);
+  await page.getByLabel('Email').fill(email);
+  await page.getByLabel('Password').fill('definitely the wrong password');
+  await page.getByRole('button', { name: 'Sign in' }).click();
+  await expect(page.getByText('Invalid email or password.')).toBeVisible();
+  await expect(page.getByLabel('Password')).toHaveValue('');
+
+  await page.getByRole('link', { name: 'Create an account' }).click();
+  await expect(page.getByRole('heading', { name: 'Create your account' })).toBeVisible();
+
+  for (const [width, height] of [[360, 740], [820, 1180], [1440, 900]]) {
+    await page.setViewportSize({ width, height });
+    await page.goto('/login');
+    await expect(page.getByRole('heading', { name: 'Sign in' })).toBeVisible();
+    await expect(page.getByLabel('Email')).toBeInViewport();          // the form is reachable without scrolling
+    const overflow = await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
+    expect(overflow, `horizontal overflow at ${width}px`).toBeLessThanOrEqual(0);
+  }
+});

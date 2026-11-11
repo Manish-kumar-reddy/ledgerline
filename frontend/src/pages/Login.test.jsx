@@ -78,4 +78,21 @@ describe('Login', () => {
     await screen.findByText('Invalid email or password.');
     expect(screen.queryByText(/up to a minute/)).not.toBeInTheDocument();
   });
+
+  it('keeps the create-account link and labels the ledger as an example illustration', () => {
+    renderLogin(vi.fn());
+    expect(screen.getByRole('link', { name: 'Create an account' })).toHaveAttribute('href', '/register');
+    expect(screen.getByRole('heading', { level: 1, name: 'Sign in' })).toBeInTheDocument();
+    expect(screen.getByRole('figure', { name: /Example journal/ })).toBeInTheDocument();
+    expect(screen.getByText(/Sample figures/)).toBeInTheDocument();
+  });
+
+  it('keeps the sign-in button disabled until both fields are filled', async () => {
+    const user = renderLogin(vi.fn());
+    expect(screen.getByRole('button', { name: 'Sign in' })).toBeDisabled();
+    await user.type(screen.getByLabelText('Email'), 'asha@example.com');
+    expect(screen.getByRole('button', { name: 'Sign in' })).toBeDisabled();
+    await user.type(screen.getByLabelText('Password'), 'x');
+    expect(screen.getByRole('button', { name: 'Sign in' })).toBeEnabled();
+  });
 });
