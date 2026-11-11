@@ -1462,7 +1462,7 @@ frontend suites were not rerun. Nothing staged, committed or pushed.
 
 ## Session 17: 2026-11-11, sign-in page visual redesign
 
-Commit reference: pending. The latest commit is `80b0957` (Prepare LedgerLine for production deployment).
+Commit reference: `c8c9065` (Redesign LedgerLine sign-in experience).
 
 ### Prompt
 
@@ -1525,4 +1525,4 @@ So in that shell the two overrides are required; the developer reports that all 
 command in this session touched `ledgerline_db`: the E2E runner only uses `ledgerline_test_db`, and the screenshots
 used no backend. The AI reported this and changed nothing.
 
-Nothing was staged, committed or pushed.
+The six Session 17 files (`PROMPTS.md`, `frontend/e2e/ledgerline.spec.js`, `frontend/src/pages/Login.jsx`, `frontend/src/pages/Login.test.jsx`, `frontend/src/pages/SignInShowcase.jsx`, `frontend/src/styles/signin.css`) were committed as `c8c9065`; that commit has not yet been pushed.
