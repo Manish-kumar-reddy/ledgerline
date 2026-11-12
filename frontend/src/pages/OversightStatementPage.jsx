@@ -1,6 +1,8 @@
 import { useState } from 'react';
 import { Link, useParams } from 'react-router';
 import * as oversightApi from '../api/oversight.js';
+import StatementFilters, { FilterSummary } from '../components/StatementFilters.jsx';
+import { NO_FILTERS, isFiltered } from '../components/statementFilterOptions.js';
 import StatementTable from '../components/StatementTable.jsx';
 import { useAsync } from '../components/useAsync.js';
 import { CopyId, EmptyState, ErrorPanel, Money, Pagination, Skeleton, StatusBadge } from '../components/ui.jsx';
@@ -8,7 +10,14 @@ import { CopyId, EmptyState, ErrorPanel, Money, Pagination, Skeleton, StatusBadg
 export default function OversightStatementPage({ api = oversightApi }) {
   const { id } = useParams();
   const [page, setPage] = useState(0);
-  const { loading, data, error, reload } = useAsync(() => api.anyStatement(id, page, 25), [id, page]);
+  const [filters, setFilters] = useState(NO_FILTERS);
+  const { loading, data, error, reload } = useAsync(() => api.anyStatement(id, page, 25, filters),
+    [id, page, filters.status, filters.operation]);
+
+  function changeFilters(next) {
+    setFilters(next);
+    setPage(0);
+  }
 
   if (error?.status === 404) {
     return <EmptyState title="Account not found."><p><Link to="/oversight/accounts">Back to all accounts</Link></p></EmptyState>;
@@ -35,7 +44,11 @@ export default function OversightStatementPage({ api = oversightApi }) {
           </div>
         </header>
       )}
-      {data && data.lines.length === 0 && <EmptyState title="No activity on this account." />}
+      {account && <StatementFilters value={filters} onChange={changeFilters} idPrefix="oversight-statement" />}
+      {data && <FilterSummary filters={filters} totalLines={data.totalLines} />}
+      {data && data.lines.length === 0 && (
+        <EmptyState title={isFiltered(filters) ? 'No lines match these filters.' : 'No activity on this account.'} />
+      )}
       {data && data.lines.length > 0 && (
         <>
           <StatementTable lines={data.lines} currentUserId={null} />

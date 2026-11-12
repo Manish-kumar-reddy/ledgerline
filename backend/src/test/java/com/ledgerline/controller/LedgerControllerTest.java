@@ -10,6 +10,7 @@ import static org.mockito.BDDMockito.willThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.header;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
@@ -23,8 +24,10 @@ import com.ledgerline.repository.UserRepository;
 import com.ledgerline.security.JwtTokenService;
 import com.ledgerline.service.LedgerService;
 import com.ledgerline.service.PostingResult;
+import com.ledgerline.service.StatementFilter;
 import com.ledgerline.service.StatementService;
 import com.ledgerline.support.WebSecurityTest;
+import java.net.URI;
 import java.time.Instant;
 import java.util.Optional;
 import java.util.UUID;
@@ -162,5 +165,33 @@ class LedgerControllerTest {
         deposit("key-empty", "{\"amount\":\"1\",\"description\":\"\"}").andExpect(status().isCreated());
         verify(ledger).deposit(eq(ACCOUNT), eq(100L), eq(null), eq("key-blank"));
         verify(ledger).deposit(eq(ACCOUNT), eq(100L), eq(null), eq("key-empty"));
+    }
+
+    private ResultActions statement(String query) throws Exception {
+        // URI.create keeps the query exactly as written (a string template would re-encode '%').
+        return mvc.perform(get(URI.create("/api/accounts/" + ACCOUNT + "/statement" + query))
+                .header("Authorization", "Bearer " + holderToken()));
+    }
+
+    @Test
+    void statementFiltersReachTheServiceAsEnums() throws Exception {
+        statement("").andExpect(status().isOk());
+        verify(statements).own(ACCOUNT, StatementFilter.NONE, 0, 50);
+        statement("?status=REFUSED&operation=TRANSFER&page=2&size=10").andExpect(status().isOk());
+        verify(statements).own(ACCOUNT,
+                new StatementFilter(StatementFilter.Status.REFUSED, StatementFilter.Operation.TRANSFER), 2, 10);
+        statement("?operation=DEPOSIT").andExpect(status().isOk());
+        verify(statements).own(ACCOUNT, new StatementFilter(null, StatementFilter.Operation.DEPOSIT), 0, 50);
+    }
+
+    // Exact upper-case single values only: empty, lower case, padded, unknown, SQL-like and repeated values are 400.
+    @ParameterizedTest
+    @ValueSource(strings = {"?status=", "?status=posted", "?status=%20POSTED", "?status=PENDING",
+            "?status=POSTED&status=REFUSED", "?status=POSTED'%20or%20'1'='1", "?operation=", "?operation=transfer",
+            "?operation=REFUND", "?operation=DEPOSIT,TRANSFER", "?operation=DEPOSIT&operation=DEPOSIT",
+            "?status=POSTED&operation=PAYMENT"})
+    void invalidStatementFiltersAre400BeforeTheService(String query) throws Exception {
+        statement(query).andExpect(status().isBadRequest());
+        verifyNoInteractions(statements);
     }
 }

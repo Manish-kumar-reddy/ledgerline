@@ -4,6 +4,8 @@ import * as accountsApi from '../api/accounts.js';
 import * as ledgerApi from '../api/ledger.js';
 import { useAuth } from '../auth/session.js';
 import MoneyForm from '../components/MoneyForm.jsx';
+import StatementFilters, { FilterSummary } from '../components/StatementFilters.jsx';
+import { NO_FILTERS, isFiltered } from '../components/statementFilterOptions.js';
 import StatementTable from '../components/StatementTable.jsx';
 import { useAsync } from '../components/useAsync.js';
 import { CopyId, EmptyState, ErrorPanel, Money, Pagination, Skeleton, StatusBadge } from '../components/ui.jsx';
@@ -15,8 +17,15 @@ export default function AccountPage({ accounts = accountsApi, ledger = ledgerApi
   const { user } = useAuth();
   const [tab, setTab] = useState('deposit');
   const [page, setPage] = useState(0);
+  const [filters, setFilters] = useState(NO_FILTERS);
   const account = useAsync(() => accounts.getAccount(id), [id]);
-  const statement = useAsync(() => ledger.statement(id, page, 25), [id, page]);
+  const statement = useAsync(() => ledger.statement(id, page, 25, filters),
+    [id, page, filters.status, filters.operation]);
+
+  function changeFilters(next) {
+    setFilters(next);
+    setPage(0);         // page numbers of the old selection mean nothing in the new one
+  }
 
   function refresh() {
     account.reload();
@@ -75,9 +84,14 @@ export default function AccountPage({ accounts = accountsApi, ledger = ledgerApi
               <h2 id="statement">Statement</h2>
               <button type="button" className="button button--ghost" onClick={() => window.print()}>Print</button>
             </div>
+            <StatementFilters value={filters} onChange={changeFilters} />
             {statement.loading && !statement.data && <Skeleton rows={5} />}
             <ErrorPanel error={statement.error} onRetry={statement.reload} />
-            {statement.data && statement.data.lines.length === 0 && (
+            {statement.data && <FilterSummary filters={filters} totalLines={statement.data.totalLines} />}
+            {statement.data && statement.data.lines.length === 0 && isFiltered(filters) && (
+              <EmptyState title="No lines match these filters." />
+            )}
+            {statement.data && statement.data.lines.length === 0 && !isFiltered(filters) && (
               <EmptyState title="No activity yet.">
                 <p>Deposits, withdrawals, transfers and refused attempts will appear here.</p>
               </EmptyState>

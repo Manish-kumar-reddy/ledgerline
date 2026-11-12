@@ -1525,4 +1525,165 @@ So in that shell the two overrides are required; the developer reports that all 
 command in this session touched `ledgerline_db`: the E2E runner only uses `ledgerline_test_db`, and the screenshots
 used no backend. The AI reported this and changed nothing.
 
-The six Session 17 files (`PROMPTS.md`, `frontend/e2e/ledgerline.spec.js`, `frontend/src/pages/Login.jsx`, `frontend/src/pages/Login.test.jsx`, `frontend/src/pages/SignInShowcase.jsx`, `frontend/src/styles/signin.css`) were committed as `c8c9065`; that commit has not yet been pushed.
+The six Session 17 files (`PROMPTS.md`, `frontend/e2e/ledgerline.spec.js`, `frontend/src/pages/Login.jsx`, `frontend/src/pages/Login.test.jsx`, `frontend/src/pages/SignInShowcase.jsx`, `frontend/src/styles/signin.css`) were committed as `c8c9065`, which has since been pushed to `origin/main`.
+
+---
+
+## Session 18: 2026-11-12, server-side statement filters
+
+Commit reference: none yet. These changes are uncommitted; the latest commit is `793c950` (Fix production CSP
+backend origin).
+
+### Prompt 1: inspection only
+
+> Inspect the existing LedgerLine project, especially the transaction history, statement pages, backend transaction
+> APIs, and related tests. Do not modify any files yet… Report… A small, safe improvement we can implement today…
+> Do not change the database schema or existing financial logic.
+
+**What the AI found (read-only):**
+- **Existing:** both statement endpoints (account holder and ADMIN/AUDITOR) with page and size, ownership and role
+  checks, every posted and refused line with running balance and initiator, oldest first; no filtering of any kind.
+- **Gaps:** no status or type filter; the newest activity is on the last page; no date range or CSV export; the
+  counterparty is shown only as a short id.
+- **AI suggested:** optional `status` and `operation` filters applied on the server, read-only, with no schema
+  change. It advised against filtering only the 25 lines already loaded in the browser, because page counts would
+  then be wrong.
+- It also pointed out that the local E2E CSP substitution no longer matched `vercel.json` after `793c950` (see
+  Session 19).
+
+### Prompt 2: implementation
+
+> Implement server-side transaction statement filtering in LedgerLine… optional status filtering: POSTED and
+> REFUSED… operation filtering: DEPOSIT, WITHDRAWAL and TRANSFER… both account-holder and ADMIN/AUDITOR statement
+> endpoints… Keep existing account ownership and role-based authorization checks unchanged… Invalid values must
+> return HTTP 400… filtered pagination and total counts are correct… Do not modify financial posting logic, database
+> migrations, or production environment configuration… Do not commit or push.
+
+### What the AI changed
+
+- **API:** `GET /api/accounts/{id}/statement` and `GET /api/oversight/accounts/{id}/statement` accept optional
+  `status=POSTED|REFUSED` and `operation=DEPOSIT|WITHDRAWAL|TRANSFER`, alone or together.
+- **Validation:** each parameter is checked with `@Pattern` against the exact upper-case values before the service
+  is called. Empty, lower-case, padded, unknown, comma-separated and repeated values give 400.
+- **SQL (`StatementService`):** the existing query was split into fixed pieces. A filter appends only a fixed
+  condition; the operation value is a bound parameter, so no request text is ever placed in SQL.
+- **Counts:** with a filter, `totalLines` and `totalPages` come from a `count(*)` over the same conditions, in the
+  same REPEATABLE READ transaction as the lines. Without a filter, the account's last sequence number is still used.
+- **Lines are unchanged:** each filtered line keeps its original sequence number, its stored running balance, its
+  refusal reason and its initiator, in sequence order. The account header always shows the real balance.
+- **Authorization unchanged:** the ownership check (`own`) and role checks (`@PreAuthorize`, URL rules) are the same
+  code; filters apply only after them.
+- **New files:** `StatementFilter.java` (the filter values), `StatementFilters.jsx` (two dropdowns, "Clear filters",
+  and a printed note such as "Filtered: Refused · Transfers. 2 matching lines"), `statementFilterOptions.js`
+  (option lists kept apart from the component so lint stays clean).
+- **Pages:** both statement pages hold the filters; any change goes back to page 1. When nothing matches, the page
+  says "No lines match these filters." rather than "No activity yet." The dropdowns are hidden when printing.
+- **Not changed:** posting functions and logic, migrations V1–V6, security configuration, `vercel.json`,
+  deployment files.
+
+### Problems found and fixed by the AI during its own work
+
+1. **Test encoding:** MockMvc's string-template `get()` re-encodes `%`, so a test meant to send a padded value
+   (`%20POSTED`) would have sent something else. The controller test was changed to `get(URI.create(...))`.
+2. **Lint:** exporting constants next to components produced four `only-export-components` warnings; the constants
+   were moved to `statementFilterOptions.js`.
+3. A first name for that file (`statementFilters.js`) differed from `StatementFilters.jsx` only in letter case and
+   extension; it was renamed to avoid confusion on case-insensitive file systems.
+
+### Tests added
+
+- `StatementFilterIT` (7, real PostgreSQL):
+  - unfiltered output unchanged;
+  - every filter combination returns the original lines with their stored balances;
+  - filtered paging, totals and an empty zero-page result;
+  - the transfer recipient's statement;
+  - ADMIN and AUDITOR results byte-identical to the holder's;
+  - foreign account still the same 404 as unknown, staff 403 on the holder endpoint, holder 403 on oversight, 401
+    without a token;
+  - invalid values give 400 on both endpoints and change nothing.
+- `LedgerControllerTest` (+13): filters reach the service as enums; 12 invalid queries give 400 with no service call.
+- `LedgerMethodSecurityTest`: calls updated to the new method signature only; assertions unchanged.
+- Frontend: `StatementFiltering.test.jsx` (10, the same 5 on each page: filters sent, reset to page 1, empty
+  result, offered values match the server's, a 400 shown as an error); `ledger.test.js` (+1, only set filters sent).
+
+Results are in Session 19, which ran the full checks after the CSP fix.
+
+---
+
+## Session 19: 2026-11-12, local E2E CSP failure after the production origin change
+
+Commit reference: none yet (uncommitted). The change that exposed the problem is `793c950` (Fix production CSP
+backend origin), which replaced `https://REPLACE-WITH-RENDER-BACKEND-HOST` in `frontend/vercel.json` with
+`https://ledgerline-g6bg.onrender.com`. When making that edit, the AI warned that the local E2E preview depended on
+the placeholder and would probably break.
+
+### Prompt 1: investigation only
+
+> The Playwright E2E run produced 5 failures. Please investigate only; do not edit files… Four tests fail at
+> `frontend/e2e/ledgerline.spec.js:27` because `getByText('Registration complete')` is not visible… The CSP test at
+> line 146 expects `connect-src 'self' http://localhost:8081`… Confirm whether the assertion is outdated…
+
+The failing run was the developer's. The AI read its Playwright artifacts in `frontend/test-results/`.
+
+**Evidence:**
+- **Page snapshots** (four tests): the registration form was still shown, with the alert "Cannot reach the
+  LedgerLine server. Check your connection." The app shows this when no HTTP response arrives, not for an HTTP error.
+- **Trace network log:** `POST http://localhost:8081/api/auth/register` had status `-1` and failure text `csp`;
+  each of the four traces had exactly one request blocked this way.
+- **Trace console:** "Connecting to 'http://localhost:8081/api/auth/register' violates the following Content
+  Security Policy directive: "connect-src 'self' https://ledgerline-g6bg.onrender.com". The action has been blocked."
+- **Backend log** (`frontend/e2e/backend.log`): the backend started and stopped cleanly and received no
+  registration request.
+- **CSP test:** failed at its header check, receiving `connect-src 'self' https://ledgerline-g6bg.onrender.com`.
+
+**Root cause:** `vite.config.js` built the preview's headers from `vercel.json`, replacing the placeholder text with
+the API origin of the build under test. After `793c950` the placeholder no longer existed, so the replacement
+silently did nothing. The preview served the production `connect-src`, and the browser blocked every call to the
+local backend. One cause explained all five failures.
+
+**AI's assessment:** the assertion at line 146 was not outdated. It checks the policy the local preview should
+serve. Changing it to the Render host would pass the header check while API calls stayed blocked, which would only
+hide the problem. It proposed fixing `vite.config.js` instead.
+
+### Prompt 2: apply the fix
+
+> Please apply the minimal fix identified in your investigation… update the local preview CSP replacement so it
+> replaces the production API origin in `connect-src 'self'` with the local backend origin… Add a clear error if the
+> expected CSP directive cannot be replaced… Remove or update the obsolete `API_PLACEHOLDER` constant and comments…
+> Update the outdated description in `THREATS.md` section 9. Do not change `vercel.json`… Do not weaken CSP.
+
+### What the AI changed
+
+- **`frontend/vite.config.js`:**
+  - `API_PLACEHOLDER` replaced by the pattern `/(connect-src 'self') [^;\s]+/`;
+  - only the origin after `connect-src 'self'` is swapped for the build's API origin (`http://localhost:8081` in
+    `run-e2e.sh`); every other header and directive is copied unchanged, and HSTS is still left out for plain-HTTP
+    localhost, as before;
+  - if the CSP has no such origin, the preview stops with an error instead of serving a policy that blocks the API.
+- **`THREATS.md` §9:** the placeholder sentence was replaced. It now names the production API origin, describes the
+  preview swap and its guard, and says `connect-src` must change with the backend host.
+- **Not changed:** `vercel.json`, the E2E spec (including line 146), application code, statement filters,
+  production configuration.
+
+**Why production CSP was not weakened:**
+- `vercel.json`, the only source of production headers, is unchanged and still allows only `'self'` and the Render
+  origin.
+- `vite.config.js` affects only local `vite preview`.
+- Even there, only that single origin is substituted; no source is added, and no directive is relaxed.
+
+### Verification (actually run on 2026-11-12)
+
+| Check | Result |
+|---|---|
+| `./mvnw clean verify -Pintegration-tests` (run after the Session 18 changes; no backend change since) | 303 unit tests (290 before) and 128 integration tests (121 before), 0 failures, BUILD SUCCESS; `StatementFilterIT` 7/7, `LedgerControllerTest` 36/36, `LedgerApiIT` 10/10 |
+| `npm run lint` | no warnings or errors |
+| `npx vitest run` | 13 files, 78 tests passed |
+| `npm run build` | built |
+| Headers from `vite preview` with `VITE_API_BASE_URL=http://localhost:8081` | `connect-src 'self' http://localhost:8081`; all other directives as in `vercel.json`; `nosniff`, `DENY`, `no-referrer`, `Permissions-Policy`, `same-origin` present; HSTS absent as before |
+| Guard, on scratchpad copies of `vercel.json` | a copy with no API origin in `connect-src` threw the new error; an unchanged copy gave `connect-src 'self' http://localhost:8081` |
+| E2E, from the repository root: `PGSSLMODE=disable PGCHANNELBINDING=disable ./frontend/e2e/run-e2e.sh` (real backend on `ledgerline_test_db`) | 5/5 passed, including the four registration-based tests and the CSP test with its original assertion, and no CSP violations |
+
+No E2E test covers the new statement filters; they are covered by the backend integration tests and the frontend
+tests in Session 18.
+
+The files changed in Sessions 18 and 19 are uncommitted and unpushed, awaiting the developer's review.

@@ -154,9 +154,11 @@ Prepared and checked locally; **not yet deployed**. Items marked "verify" must b
   needs a valid token.
 - **CSP and browser exposure.** `vercel.json` sets a Content-Security-Policy without `unsafe-inline` or
   `unsafe-eval` and with `connect-src` limited to the app and the API origin, plus `frame-ancestors 'none'`,
-  `nosniff`, `no-referrer` and HSTS. The E2E suite runs under the same policy (via `vite preview`) and fails on any
-  CSP violation. The access token stays in memory only. A placeholder API origin left in `vercel.json` blocks all
-  API calls (fails closed).
+  `nosniff`, `no-referrer` and HSTS. `connect-src` names the production API origin
+  (`https://ledgerline-g6bg.onrender.com`). The E2E suite runs under the same policy (via `vite preview`, which
+  swaps only that origin for the local backend's and refuses to start if it cannot) and fails on any CSP violation.
+  The access token stays in memory only. If the backend host changes, `connect-src` must be updated with it, or the
+  browser blocks all API calls (fails closed).
 - **Reverse proxy and client IP.** With `SERVER_FORWARD_HEADERS_STRATEGY=native`, Tomcat trusts `X-Forwarded-For`
   only from private-network addresses. If Render's proxy reaches the app from another range, every client shares
   one per-IP limit (availability risk, not a bypass: the app is reachable only through Render's proxy, so the header

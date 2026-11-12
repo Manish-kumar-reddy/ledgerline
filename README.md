@@ -574,8 +574,8 @@ floating point anywhere.
 | `POST /api/accounts/{id}/deposits` `{"amount","description"?}` + `Idempotency-Key` | 401 | own account (else 404) | 403 | 403 |
 | `POST /api/accounts/{id}/withdrawals` (same body) | 401 | own account (else 404) | 403 | 403 |
 | `POST /api/accounts/{id}/transfers` `{"toAccountId","amount","description"?}` + `Idempotency-Key` | 401 | from own account to an active customer account | 403 | 403 |
-| `GET /api/accounts/{id}/statement?page=&size=` | 401 | own account (else 404) | 403 | 403 |
-| `GET /api/oversight/accounts/{id}/statement?page=&size=` | 401 | 403 | any account, incl. settlement | any account, incl. settlement |
+| `GET /api/accounts/{id}/statement?page=&size=&status=&operation=` | 401 | own account (else 404) | 403 | 403 |
+| `GET /api/oversight/accounts/{id}/statement?page=&size=&status=&operation=` | 401 | 403 | any account, incl. settlement | any account, incl. settlement |
 | `GET /api/oversight/reconciliation` | 401 | 403 | 200 | 200 |
 
 Response codes for money requests:
@@ -599,6 +599,8 @@ curl -X POST localhost:8080/api/accounts/<id>/transfers -H "Authorization: Beare
   -H 'Content-Type: application/json' -H 'Idempotency-Key: 8f6c0e1a-transfer-1' \
   -d '{"toAccountId":"<other id>","amount":"100.00","description":"rent"}'
 curl localhost:8080/api/accounts/<id>/statement -H "Authorization: Bearer <token>"
+curl "localhost:8080/api/accounts/<id>/statement?status=REFUSED&operation=TRANSFER" -H "Authorization: Bearer <token>"
+curl "localhost:8080/api/oversight/accounts/<id>/statement?operation=DEPOSIT&page=0&size=25" -H "Authorization: Bearer <staff token>"
 ```
 
 **Statements** list every posted DEBIT and CREDIT and every refused attempt of the account, in its own sequence
@@ -606,6 +608,29 @@ order (1, 2, 3, … with no gaps), each with the **running balance** (stored at 
 refused line repeats the unchanged balance), the **initiator** (user id), the other account, the operation, the
 amount, the reason for refusals, the description and the time. The response also contains the account and its
 current balance. The initiator of a transfer received is the sender's user id; no names or emails are shown.
+
+**Statement query parameters.** Both statement endpoints, `GET /api/accounts/{id}/statement` (the account
+holder's own account) and `GET /api/oversight/accounts/{id}/statement` (ADMIN and AUDITOR, any account), accept the
+same optional parameters:
+
+| Parameter | Values | Default |
+|---|---|---|
+| `page` | 0 to 10000 | `0` |
+| `size` | 1 to 100 | `50` |
+| `status` | `POSTED` or `REFUSED` | all lines |
+| `operation` | `DEPOSIT`, `WITHDRAWAL` or `TRANSFER` | all operations |
+
+- `status` and `operation` can be used individually or together; together, a line must match both (for example
+  `?status=REFUSED&operation=TRANSFER` lists refused transfers only).
+- With a filter, `totalLines` and `totalPages` count only the matching lines, so pagination runs over the matching
+  lines. Without one, they count the whole statement, as before.
+- A filter only chooses which lines are returned. Each line keeps its original `sequence` and its stored running
+  `balance`, still in sequence order, so a filtered page can have gaps in the sequence. The `account` object always
+  shows the account's real current balance.
+- Values are exact and upper case, one per parameter. An empty, lower-case, unknown, comma-separated or repeated
+  value gives 400.
+- Filters do not change who may read a statement: the table above still applies (another holder's account is the
+  same 404 as an unknown one).
 
 **Reconciliation** recomputes everything from the raw rows and reports each difference: account balance vs.
 credits − debits, every running balance, journal debits vs. credits, sequence numbers vs. line counts, entries or

@@ -3,9 +3,11 @@ package com.ledgerline.controller;
 import com.ledgerline.dto.ReconciliationResponse;
 import com.ledgerline.dto.StatementResponse;
 import com.ledgerline.service.ReconciliationService;
+import com.ledgerline.service.StatementFilter;
 import com.ledgerline.service.StatementService;
 import jakarta.validation.constraints.Max;
 import jakarta.validation.constraints.Min;
+import jakarta.validation.constraints.Pattern;
 import java.util.UUID;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -29,8 +31,10 @@ public class OversightLedgerController {
     @GetMapping("/accounts/{accountId}/statement")
     public StatementResponse statement(@PathVariable UUID accountId,
             @RequestParam(defaultValue = "0") @Min(0) @Max(AccountController.MAX_PAGE) int page,
-            @RequestParam(defaultValue = "50") @Min(1) @Max(AccountController.MAX_PAGE_SIZE) int size) {
-        return statements.any(accountId, page, size);
+            @RequestParam(defaultValue = "50") @Min(1) @Max(AccountController.MAX_PAGE_SIZE) int size,
+            @RequestParam(required = false) @Pattern(regexp = StatementFilter.STATUSES) String status,
+            @RequestParam(required = false) @Pattern(regexp = StatementFilter.OPERATIONS) String operation) {
+        return statements.any(accountId, StatementFilter.of(status, operation), page, size);
     }
 
     @GetMapping("/reconciliation")

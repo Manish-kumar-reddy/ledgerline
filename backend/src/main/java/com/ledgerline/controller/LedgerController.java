@@ -7,6 +7,7 @@ import com.ledgerline.dto.TransferRequest;
 import com.ledgerline.money.Money;
 import com.ledgerline.service.LedgerService;
 import com.ledgerline.service.PostingResult;
+import com.ledgerline.service.StatementFilter;
 import com.ledgerline.service.StatementService;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.Max;
@@ -70,8 +71,10 @@ public class LedgerController {
     @GetMapping("/statement")
     public StatementResponse statement(@PathVariable UUID accountId,
             @RequestParam(defaultValue = "0") @Min(0) @Max(AccountController.MAX_PAGE) int page,
-            @RequestParam(defaultValue = "50") @Min(1) @Max(AccountController.MAX_PAGE_SIZE) int size) {
-        return statements.own(accountId, page, size);
+            @RequestParam(defaultValue = "50") @Min(1) @Max(AccountController.MAX_PAGE_SIZE) int size,
+            @RequestParam(required = false) @Pattern(regexp = StatementFilter.STATUSES) String status,
+            @RequestParam(required = false) @Pattern(regexp = StatementFilter.OPERATIONS) String operation) {
+        return statements.own(accountId, StatementFilter.of(status, operation), page, size);
     }
 
     static ResponseEntity<PostingResponse> respond(PostingResult result) {

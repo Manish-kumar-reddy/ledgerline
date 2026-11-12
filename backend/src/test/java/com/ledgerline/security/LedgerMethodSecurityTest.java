@@ -9,6 +9,7 @@ import com.ledgerline.entity.Role;
 import com.ledgerline.repository.AccountRepository;
 import com.ledgerline.service.LedgerService;
 import com.ledgerline.service.ReconciliationService;
+import com.ledgerline.service.StatementFilter;
 import com.ledgerline.service.StatementService;
 import java.time.Instant;
 import java.util.UUID;
@@ -71,14 +72,14 @@ class LedgerMethodSecurityTest {
         assertThatThrownBy(() -> ledger.deposit(account, 1, null, "k")).isInstanceOf(AccessDeniedException.class);
         assertThatThrownBy(() -> ledger.withdraw(account, 1, null, "k")).isInstanceOf(AccessDeniedException.class);
         assertThatThrownBy(() -> ledger.transfer(account, UUID.randomUUID(), 1, null, "k")).isInstanceOf(AccessDeniedException.class);
-        assertThatThrownBy(() -> statements.own(account, 0, 10)).isInstanceOf(AccessDeniedException.class);
+        assertThatThrownBy(() -> statements.own(account, StatementFilter.NONE, 0, 10)).isInstanceOf(AccessDeniedException.class);
         verifyNoInteractions(accounts, jdbc);
     }
 
     @Test
     void anAccountHolderCannotUseOversight() {
         signInAs(Role.ACCOUNT_HOLDER);
-        assertThatThrownBy(() -> statements.any(UUID.randomUUID(), 0, 10)).isInstanceOf(AccessDeniedException.class);
+        assertThatThrownBy(() -> statements.any(UUID.randomUUID(), StatementFilter.NONE, 0, 10)).isInstanceOf(AccessDeniedException.class);
         assertThatThrownBy(() -> reconciliation.reconcile()).isInstanceOf(AccessDeniedException.class);
         verifyNoInteractions(accounts, jdbc);
     }

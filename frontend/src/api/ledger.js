@@ -25,8 +25,15 @@ export function transfer(accountId, { toAccountId, amount, description }, idempo
     { toAccountId, ...body(amount, description) }, idempotencyKey);
 }
 
-export async function statement(accountId, page = 0, size = 25) {
-  return (await api.get(`/api/accounts/${encodeURIComponent(accountId)}/statement`, { params: { page, size } })).data;
+/** filters: { status?: 'POSTED' | 'REFUSED', operation?: 'DEPOSIT' | 'WITHDRAWAL' | 'TRANSFER' }; empty means all. */
+export async function statement(accountId, page = 0, size = 25, filters = {}) {
+  return (await api.get(`/api/accounts/${encodeURIComponent(accountId)}/statement`,
+    { params: statementParams(page, size, filters) })).data;
+}
+
+/** Query parameters for a statement page; unset or empty filters are left out (the server rejects empty values). */
+export function statementParams(page, size, { status, operation } = {}) {
+  return { page, size, ...(status ? { status } : {}), ...(operation ? { operation } : {}) };
 }
 
 function body(amount, description) {

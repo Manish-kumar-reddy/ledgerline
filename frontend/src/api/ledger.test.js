@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { api } from './client.js';
-import { deposit, transfer, withdraw } from './ledger.js';
+import { anyStatement } from './oversight.js';
+import { deposit, statement, transfer, withdraw } from './ledger.js';
 
 let seen;
 let reply;
@@ -41,5 +42,19 @@ describe('ledger api', () => {
     reply = { status: 409, headers: {}, data: { title: 'Idempotency key reused' } };
     await expect(transfer('acc-1', { toAccountId: 'acc-2', amount: '5' }, 'key-3')).rejects.toMatchObject({ status: 409 });
     expect(JSON.parse(seen[0].data)).toEqual({ toAccountId: 'acc-2', amount: '5' });
+  });
+
+  it('sends only the statement filters that are set, on both statement endpoints', async () => {
+    reply = { status: 200, headers: {}, data: { lines: [] } };
+    await statement('acc 1', 2, 25, { status: 'REFUSED', operation: '' });
+    await anyStatement('acc-1', 0, 25, { status: '', operation: 'TRANSFER' });
+    await statement('acc-1');
+    await anyStatement('acc-1', 1, 10, { status: 'POSTED', operation: 'DEPOSIT' });
+    expect(seen.map((config) => [config.url, config.params])).toEqual([
+      ['/api/accounts/acc%201/statement', { page: 2, size: 25, status: 'REFUSED' }],
+      ['/api/oversight/accounts/acc-1/statement', { page: 0, size: 25, operation: 'TRANSFER' }],
+      ['/api/accounts/acc-1/statement', { page: 0, size: 25 }],
+      ['/api/oversight/accounts/acc-1/statement', { page: 1, size: 10, status: 'POSTED', operation: 'DEPOSIT' }],
+    ]);
   });
 });
