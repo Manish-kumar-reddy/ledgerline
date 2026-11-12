@@ -1531,8 +1531,9 @@ The six Session 17 files (`PROMPTS.md`, `frontend/e2e/ledgerline.spec.js`, `fron
 
 ## Session 18: 2026-11-12, server-side statement filters
 
-Commit reference: none yet. These changes are uncommitted; the latest commit is `793c950` (Fix production CSP
-backend origin).
+Commit reference: [`93dc55f`](https://github.com/Manish-kumar-reddy/ledgerline/commit/93dc55f) (Add filtered
+transaction statements), committed locally and not yet pushed. It contains the statement-filter implementation,
+its tests and its documentation (`README.md`, `PROMPTS.md`).
 
 ### Prompt 1: inspection only
 
@@ -1612,10 +1613,12 @@ Results are in Session 19, which ran the full checks after the CSP fix.
 
 ## Session 19: 2026-11-12, local E2E CSP failure after the production origin change
 
-Commit reference: none yet (uncommitted). The change that exposed the problem is `793c950` (Fix production CSP
-backend origin), which replaced `https://REPLACE-WITH-RENDER-BACKEND-HOST` in `frontend/vercel.json` with
-`https://ledgerline-g6bg.onrender.com`. When making that edit, the AI warned that the local E2E preview depended on
-the placeholder and would probably break.
+Commit reference: [`93dc55f`](https://github.com/Manish-kumar-reddy/ledgerline/commit/93dc55f) (Add filtered
+transaction statements), committed locally and not yet pushed. The CSP preview fix (`frontend/vite.config.js`) and
+its documentation (`THREATS.md` §9) are in the same commit as Session 18. The change that exposed the problem is
+`793c950` (Fix production CSP backend origin), which replaced `https://REPLACE-WITH-RENDER-BACKEND-HOST` in
+`frontend/vercel.json` with `https://ledgerline-g6bg.onrender.com`. When making that edit, the AI warned that the
+local E2E preview depended on the placeholder and would probably break.
 
 ### Prompt 1: investigation only
 
@@ -1686,4 +1689,4 @@ hide the problem. It proposed fixing `vite.config.js` instead.
 No E2E test covers the new statement filters; they are covered by the backend integration tests and the frontend
 tests in Session 18.
 
-The files changed in Sessions 18 and 19 are uncommitted and unpushed, awaiting the developer's review.
+The files changed in Sessions 18 and 19 were committed together as `93dc55f`; that commit has not yet been pushed.
